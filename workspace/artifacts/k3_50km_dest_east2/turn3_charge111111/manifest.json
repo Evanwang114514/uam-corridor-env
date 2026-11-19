@@ -1,0 +1,171 @@
+{
+  "config": {
+    "stations": {
+      "V0": {
+        "role": "departure",
+        "xy": [
+          0.0,
+          0.0
+        ],
+        "pads": 2,
+        "takeoff_min": 0.5,
+        "landing_min": 0.5,
+        "separation_min": 0.5,
+        "stands": 3,
+        "turnaround_min": 3.0,
+        "chargers": 11,
+        "charge_soc_per_min": 0.04,
+        "parking": 24
+      },
+      "V1": {
+        "role": "departure",
+        "xy": [
+          10.0,
+          0.0
+        ],
+        "pads": 1,
+        "takeoff_min": 0.5,
+        "landing_min": 0.5,
+        "separation_min": 0.5,
+        "stands": 3,
+        "turnaround_min": 3.0,
+        "chargers": 11,
+        "charge_soc_per_min": 0.04,
+        "parking": 24
+      },
+      "V3": {
+        "role": "departure",
+        "xy": [
+          0.0,
+          10.0
+        ],
+        "pads": 1,
+        "takeoff_min": 0.5,
+        "landing_min": 0.5,
+        "separation_min": 0.5,
+        "stands": 3,
+        "turnaround_min": 3.0,
+        "chargers": 11,
+        "charge_soc_per_min": 0.04,
+        "parking": 24
+      },
+      "V2": {
+        "role": "arrival",
+        "xy": [
+          50.0,
+          0.0
+        ],
+        "pads": 6,
+        "takeoff_min": 0.5,
+        "landing_min": 0.5,
+        "separation_min": 0.5,
+        "stands": 3,
+        "turnaround_min": 3.0,
+        "chargers": 24,
+        "charge_soc_per_min": 0.04,
+        "parking": 24
+      }
+    },
+    "origins": [
+      {
+        "box": [
+          -5,
+          4,
+          -12,
+          12
+        ],
+        "weight": 1.0,
+        "distribution": "uniform"
+      }
+    ],
+    "destinations": [
+      {
+        "box": [
+          49.0,
+          55.0,
+          -4.0,
+          4.0
+        ],
+        "weight": 1.0,
+        "distribution": "uniform"
+      }
+    ],
+    "tick_min": 0.1,
+    "decision_min": 1.0,
+    "cutoff_min": 601.0,
+    "access_kmh": 40.0,
+    "egress_kmh": 40.0,
+    "air_kmh": 200.0,
+    "cav_kmh": 40.0,
+    "km_per_unit": 1.0,
+    "egress": true,
+    "fleet": 48,
+    "initial_fleet": {
+      "V0": 16,
+      "V1": 16,
+      "V3": 16
+    },
+    "seats": 1,
+    "boarding": "immediate",
+    "tlof": true,
+    "operation_time": true,
+    "turnaround": true,
+    "finite_stands": false,
+    "finite_charging": true,
+    "parking": false,
+    "energy": true,
+    "initial_soc": 0.2,
+    "reserve_soc": 0.2,
+    "target_soc": 1.0,
+    "fixed_flight_soc": 0.0,
+    "soc_per_km": 0.00413533834586466,
+    "reposition": "lq",
+    "lateral": false,
+    "fixed_returns": {},
+    "passengers": 300,
+    "arrival_min": 1.0,
+    "arrival_mode": "uniform",
+    "time_scale": 1.0,
+    "seed": 123,
+    "demand_csv": "workspace\\artifacts\\order_4301_linear_t2_dest_east2.csv"
+  },
+  "config_sha256": "c26d81532873da50b799f578ef668fe351efccbc958ed99dfa1c584ec9bbed5e",
+  "resolved_initial_fleet": {
+    "V0": 16,
+    "V1": 16,
+    "V3": 16
+  },
+  "demand": {
+    "count": 300,
+    "sha256": "f2badb68704c3669570181a443739aa67963bfdddf01d4d17af0caf612686656",
+    "last_request_min": 300.0
+  },
+  "protocol": "corridor_baselines_with_cav_v2",
+  "entrypoint_sha256": "f808bc454672e1e3377b8dfdb0f5ffb26149bf22ef85c70b4af3fe5d448bfb64",
+  "rule_service_rates": {
+    "V0": 3.0,
+    "V1": 3.0,
+    "V3": 3.0
+  },
+  "qtti_denominators": {
+    "V0": 30.0,
+    "V1": 30.0,
+    "V3": 30.0
+  },
+  "aircraft_return": "lq",
+  "cav_direct": {
+    "speed_kmh": 40.0,
+    "wait_min": 0,
+    "distance": "euclidean_km"
+  },
+  "arms": [
+    "SPF_SRC",
+    "STTF",
+    "QTTI",
+    "READY",
+    "BOTH_V0",
+    "BOTH_V1",
+    "BOTH_V3",
+    "CAV_DIRECT"
+  ]
+}
