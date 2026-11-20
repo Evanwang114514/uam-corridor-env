@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from corridor_dispatch import DISPATCH_PROTOCOL, PriorityCorridor
 import ast
 from collections import Counter
 from dataclasses import asdict, replace
@@ -21,7 +22,8 @@ from corridor_env import (Config, CorridorEnv, Region, Station, baseline_episode
 
 STATIONS = ("V0", "V1", "V3")
 LAYERS = {"E1": (False, False), "E2": (True, False), "E3": (True, True)}
-METHODS = ("UAGMC", "HAPPO", "MAPPO")
+METHODS = ("UAGMC", "UAGMC_AIR", "HAPPO", "MAPPO")
+PPO_METHODS = {"UAGMC", "UAGMC_AIR"}
 HARL_COMMIT = "b1af98b0dbab72a2eee9d160751cd09aedbb8ce2"
 LANES, LENGTH = 5, 2048
 ROLLOUT = LANES * LENGTH
@@ -83,46 +85,6 @@ def derived_trace(rows, cfg, seed):
     ])
 
 
-class PriorityCorridor(CorridorEnv):
-    """空返沿用走廊 LQ 的供需判定；联合策略只重排合法目的站。"""
-
-    priority = None
-
-    def needs(self, plane, ready, inbound, station):
-        return (self._eligible(plane, station) and self._park_available(station)
-                and len(self.queue[station]) > (ready[station] + inbound[station]) * self.cfg.seats
-                and (not self.cfg.energy or self._soc_cost(plane.station, station)
-                     + self.cfg.reserve_soc <= 1 + 1e-9))
-
-    def supply_counts(self):
-        return (Counter(p.station for p in self.planes.values() if p.state == "ready"),
-                Counter(p.target for p in self.planes.values() if p.target in self.dep))
-
-    def targets(self):
-        ready, inbound = self.supply_counts()
-        return {s for s in self.dep for p in self.planes.values()
-                if p.station in self.arr and self.needs(p, ready, inbound, s)}
-
-    def _reposition_auto(self):
-        if self.priority is None:
-            return super()._reposition_auto()
-        ready, inbound = self.supply_counts()
-        for p in self.planes.values():
-            if p.state != "ready" or p.station not in self.arr:
-                continue
-            candidates = [s for s in self.dep if self.needs(p, ready, inbound, s)]
-            candidates.sort(key=lambda s: (s != self.priority, -len(self.queue[s]), self._air(p.station, s), s))
-            if not candidates:
-                continue
-            s = candidates[0]
-            action = self._dispatch(p, s)
-            if action in {"reserved", "charging"}:
-                ready[p.station] -= 1
-            if action == "reserved":
-                inbound[s] += 1
-                self.totals["priority_match" if s == self.priority else "priority_fallback"] += 1
-
-
 def build_gym(gym, np):
     class LegacyPhase(gym.Env):
         """旧观测排列，新的物理状态；一个物理分钟只产生一次人时奖励。"""
@@ -131,10 +93,11 @@ def build_gym(gym, np):
             self.c = cfg
             self.rows = rows
             self.single = method == "UAGMC"
-            self.env = PriorityCorridor(cfg)
+            self.uagmc_observation = method in PPO_METHODS
+            self.env = PriorityCorridor(cfg, policy_returns=not self.single)
             self.action_space = gym.spaces.Discrete(3)
             self.observation_space = gym.spaces.Box(
-                -np.inf, np.inf, (6, 28) if self.single else (PACK + 8,), dtype=np.float32)
+                -np.inf, np.inf, (6, 28) if self.uagmc_observation else (PACK + 8,), dtype=np.float32)
 
         def focal(self):
             return next((p for p in self.env.passengers.values() if p.state == "route"), None)
@@ -213,9 +176,9 @@ def build_gym(gym, np):
         def observation(self, post=False, focal=None):
             if not post:
                 focal = self.focal()
-            frame, extras = self.snapshot(focal, not self.single)
+            frame, extras = self.snapshot(focal, not self.uagmc_observation)
             history = (self.history[1:] + [frame]) if post else self.history
-            if self.single:
+            if self.uagmc_observation:
                 return np.asarray(history, dtype=np.float32)
             # 延迟门未启用；保持旧版 8 个尾字段，不塞进新的资源或未来需求。
             tail = [int(post), *(int(post and self.route_index == i) for i in range(3)), 0., 0., 0., 0.]
@@ -226,7 +189,6 @@ def build_gym(gym, np):
 
         def reset(self, *, seed=None, options=None):
             super().reset(seed=seed)
-            self.env.priority = None
             self.env.reset(self.rows)
             frame, _ = self.snapshot(self.focal(), False)
             self.history = [frame]*6
@@ -269,20 +231,38 @@ def build_gym(gym, np):
                         break
                 self.phase = 1
                 return self.observation(post=True, focal=p), 0., False, False, {"physical_increment": 0}
-            targets = self.env.targets()
-            requested = STATIONS[action]
-            self.stat["air_decisions"] += 1
-            self.stat["air_no_opportunity"] += not targets
-            self.stat["air_multi_target"] += len(targets) > 1
-            self.stat["air_priority_projection"] += bool(targets) and requested not in targets
-            if requested not in targets:
-                # 无可行目标时退回默认 LQ；不把没有合法机会计成主动不调机。
-                requested = None
-            self.env.priority = requested
-            self.stat["requested_"+STATIONS[action]] += 1
+            self.env.choose_returns(STATIONS[action], self.stat)
             return self.advance()
 
-    return LegacyPhase
+    class UagmcAir(gym.Wrapper):
+        """保留原 LSTM-PPO；同一策略的两个离散输出按同一物理调机协议执行。"""
+
+        def __init__(self, cfg, rows):
+            super().__init__(LegacyPhase(cfg, rows, "UAGMC_AIR"))
+            self.action_space = gym.spaces.MultiDiscrete([len(STATIONS), len(STATIONS)])
+
+        @property
+        def stat(self):
+            return self.env.stat
+
+        @property
+        def corridor(self):
+            return self.env.env
+
+        def step(self, action):
+            if not self.action_space.contains(action):
+                raise ValueError("两个 PPO 输出均须为 V0/V1/V3 的索引")
+            _, reward, done, cutoff, info = self.env.step(int(action[0]))
+            if reward or done or cutoff or info["physical_increment"]:
+                raise RuntimeError("乘客阶段不得计步、终止或产生奖励")
+            return self.env.step(int(action[1]))
+
+    def make(cfg, rows, method):
+        if method == "UAGMC_AIR":
+            return UagmcAir(cfg, rows)
+        return LegacyPhase(cfg, rows, method)
+
+    return make
 
 
 def lstm_extractor():
@@ -409,7 +389,7 @@ def train_cell(folder, a, method, seed, cfg, rows, marks, env_class, args, autho
     if start > a.steps or start % ROLLOUT:
         raise RuntimeError("恢复位置不符合真实 rollout 边界")
     vector = SubprocVecEnv([lambda: env_class(cfg, rows, method) for _ in range(LANES)], start_method="spawn")
-    single = method == "UAGMC"
+    single = method in PPO_METHODS
     norm = None
     try:
         if meta:
@@ -568,7 +548,7 @@ def eval_cell(folder, a, method, cfg, bank, marks, env_class, args, np, torch):
             norm = VecNormalize.load(str(norm_path), vec)
             norm.training = False
             norm.norm_reward = False
-            if method == "UAGMC":
+            if method in PPO_METHODS:
                 model = PPO.load(model_path, device=a.device)
             else:
                 device = torch.device(a.device)
@@ -588,16 +568,18 @@ def eval_cell(folder, a, method, cfg, bank, marks, env_class, args, np, torch):
                     set_seed(seed, np, torch)
                     env = env_class(cfg, rows, method)
                     x, _ = env.reset(seed=123)
-                    while not env.env.done:
+                    corridor = env.corridor if method == "UAGMC_AIR" else env.env
+                    while not corridor.done:
                         obs = norm.normalize_obs(x[None])
                         with torch.no_grad():
-                            if method == "UAGMC":
-                                action = int(model.predict(obs, deterministic=False)[0][0])
+                            if method in PPO_METHODS:
+                                raw = model.predict(obs, deterministic=False)[0][0]
+                                action = raw if method == "UAGMC_AIR" else int(raw)
                             else:
                                 z, _, _ = pair[env.phase].get_actions(obs, zeros, ones)
                                 action = int(z.item())
                         x, _, _, _, _ = env.step(action)
-                    metrics = env.env.metrics()
+                    metrics = corridor.metrics()
                     results.append(dict(trace=name, role=role, policy_seed=seed, step=mark,
                                         metrics=metrics, control=dict(env.stat)))
             save(result_path, results)
@@ -647,7 +629,7 @@ def eval_rules(out, layer, cfg, bank):
     save(path, rows)
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--config", required=True, type=Path, help="E3 的 11/11/11/24 基准 manifest 或配置")
     p.add_argument("--train-trace", required=True, type=Path)
@@ -656,16 +638,16 @@ def main():
     p.add_argument("--harl-dir", type=Path, help="既有 HARL 作者源码目录；只跑 UAGMC 可省略")
     p.add_argument("--output", required=True, type=Path)
     p.add_argument("--phase", choices=("train", "eval", "all"), default="all")
-    p.add_argument("--methods", choices=METHODS, nargs="+", default=METHODS)
+    p.add_argument("--methods", choices=METHODS, nargs="+", default=("UAGMC", "HAPPO", "MAPPO"))
     p.add_argument("--layers", choices=LAYERS, nargs="+", default=tuple(LAYERS))
     p.add_argument("--seeds", type=int, nargs="+", default=(2101, 2102, 2103, 2104))
     p.add_argument("--steps", type=int, default=1_996_800, help="每格真实步数，必须是 10240 的整数倍")
     p.add_argument("--save-every", type=int, default=5, help="每隔多少轮更新保存非评估恢复点")
     p.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
-    a = p.parse_args()
+    a = p.parse_args(argv)
     if a.steps <= 0 or a.steps % ROLLOUT or a.save_every <= 0:
         p.error("训练长度须为正且对齐 10,240 步 rollout；保存间隔必须为正")
-    if set(a.methods)-{"UAGMC"} and not a.harl_dir:
+    if set(a.methods)-PPO_METHODS and not a.harl_dir:
         p.error("HAPPO/MAPPO 需要 --harl-dir")
 
     import gymnasium as gym
@@ -702,7 +684,8 @@ def main():
         offset = i % len(methods)
         for layer in dict.fromkeys(a.layers):
             tasks.extend((layer, m, seed) for m in methods[offset:]+methods[:offset])
-    contract = dict(schema="corridor_legacy_interface_v1", environment_sha=digest(Path(__file__).with_name("corridor_env.py")),
+    contract = dict(schema="corridor_legacy_interface_v2", dispatch_protocol=DISPATCH_PROTOCOL, environment_sha=digest(Path(__file__).with_name("corridor_env.py")),
+                    dispatch_sha=digest(Path(__file__).with_name("corridor_dispatch.py")),
                     entry_sha=digest(Path(__file__)), configs={k: asdict(v) for k, v in configs.items()},
                     steps_per_cell=a.steps, rollout=ROLLOUT, dev_marks=marks, train_trace_sha256=trace_hash(train),
                     bank=[dict(name=n, role=r, sha256=trace_hash(t)) for n, r, t in bank],
@@ -725,9 +708,10 @@ def main():
                 print("已暂停；移除 STOP_REQUESTED 后重跑原命令。", flush=True)
                 break
             folder = a.output/"cells"/f"{layer}__{method}__s{seed}"
-            meta = dict(layer=layer, method=method, seed=seed, harl_args=joint_args if method != "UAGMC" else None,
-                        harl_files=vendor_files if method != "UAGMC" else None,
-                        harl_pin=HARL_COMMIT if method != "UAGMC" else None)
+            meta = dict(layer=layer, method=method, seed=seed, harl_args=joint_args if method not in PPO_METHODS else None,
+                        harl_files=vendor_files if method not in PPO_METHODS else None,
+                        harl_pin=HARL_COMMIT if method not in PPO_METHODS else None,
+                        uagmc_air=("factorized_single_ppo" if method == "UAGMC_AIR" else None))
             try:
                 job = folder/"JOB.json"
                 if job.is_file() and read(job) != meta:

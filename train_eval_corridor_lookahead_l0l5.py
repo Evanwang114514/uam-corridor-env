@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from corridor_dispatch import DISPATCH_PROTOCOL, PriorityCorridor
 import copy
 import time
 import types
@@ -87,46 +88,6 @@ def derived_trace(rows, cfg, seed):
     ])
 
 
-class PriorityCorridor(CorridorEnv):
-    """空返沿用走廊 LQ 的供需判定；联合策略只重排合法目的站。"""
-
-    priority = None
-
-    def needs(self, plane, ready, inbound, station):
-        return (self._eligible(plane, station) and self._park_available(station)
-                and len(self.queue[station]) > (ready[station] + inbound[station]) * self.cfg.seats
-                and (not self.cfg.energy or self._soc_cost(plane.station, station)
-                     + self.cfg.reserve_soc <= 1 + 1e-9))
-
-    def supply_counts(self):
-        return (Counter(p.station for p in self.planes.values() if p.state == "ready"),
-                Counter(p.target for p in self.planes.values() if p.target in self.dep))
-
-    def targets(self):
-        ready, inbound = self.supply_counts()
-        return {s for s in self.dep for p in self.planes.values()
-                if p.station in self.arr and self.needs(p, ready, inbound, s)}
-
-    def _reposition_auto(self):
-        if self.priority is None:
-            return super()._reposition_auto()
-        ready, inbound = self.supply_counts()
-        for p in self.planes.values():
-            if p.state != "ready" or p.station not in self.arr:
-                continue
-            candidates = [s for s in self.dep if self.needs(p, ready, inbound, s)]
-            candidates.sort(key=lambda s: (s != self.priority, -len(self.queue[s]), self._air(p.station, s), s))
-            if not candidates:
-                continue
-            s = candidates[0]
-            action = self._dispatch(p, s)
-            if action in {"reserved", "charging"}:
-                ready[p.station] -= 1
-            if action == "reserved":
-                inbound[s] += 1
-                self.totals["priority_match" if s == self.priority else "priority_fallback"] += 1
-
-
 def build_gym(gym, np):
     class LegacyPhase(gym.Env):
         """旧观测排列，新的物理状态；一个物理分钟只产生一次人时奖励。"""
@@ -135,7 +96,7 @@ def build_gym(gym, np):
             self.c = cfg
             self.rows = rows
             self.single = method == "UAGMC"
-            self.env = PriorityCorridor(cfg)
+            self.env = PriorityCorridor(cfg, policy_returns=not self.single)
             self.action_space = gym.spaces.Discrete(3)
             self.observation_space = gym.spaces.Box(
                 -np.inf, np.inf, (6, 28) if self.single else (PACK + 8,), dtype=np.float32)
@@ -230,7 +191,6 @@ def build_gym(gym, np):
 
         def reset(self, *, seed=None, options=None):
             super().reset(seed=seed)
-            self.env.priority = None
             self.env.reset(self.rows)
             frame, _ = self.snapshot(self.focal(), False)
             self.history = [frame]*6
@@ -273,17 +233,7 @@ def build_gym(gym, np):
                         break
                 self.phase = 1
                 return self.observation(post=True, focal=p), 0., False, False, {"physical_increment": 0}
-            targets = self.env.targets()
-            requested = STATIONS[action]
-            self.stat["air_decisions"] += 1
-            self.stat["air_no_opportunity"] += not targets
-            self.stat["air_multi_target"] += len(targets) > 1
-            self.stat["air_priority_projection"] += bool(targets) and requested not in targets
-            if requested not in targets:
-                # 无可行目标时退回默认 LQ；不把没有合法机会计成主动不调机。
-                requested = None
-            self.env.priority = requested
-            self.stat["requested_"+STATIONS[action]] += 1
+            self.env.choose_returns(STATIONS[action], self.stat)
             return self.advance()
 
     return LegacyPhase
@@ -984,7 +934,7 @@ def paired_summary(statuses):
     return pairs
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--config", required=True, type=Path, help="E3 的 11/11/11/24 基准 manifest 或配置")
     p.add_argument("--train-trace", required=True, type=Path)
@@ -999,7 +949,7 @@ def main():
     p.add_argument("--steps", type=int, default=1_996_800, help="每格真实步数，必须是 10240 的整数倍")
     p.add_argument("--save-every", type=int, default=5, help="每隔多少轮更新保存非评估恢复点")
     p.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
-    a = p.parse_args()
+    a = p.parse_args(argv)
     if a.steps <= 0 or a.steps % ROLLOUT or a.save_every <= 0:
         p.error("训练长度须为正且对齐 10,240 步 rollout；保存间隔必须为正")
 
@@ -1037,7 +987,8 @@ def main():
         random.Random(14112027 + seed).shuffle(methods)
         for layer in dict.fromkeys(a.layers):
             tasks.extend((layer, m, seed) for m in methods)
-    contract = dict(schema="corridor_lookahead_happo_l0l5_v1", arms=ARMS,
+    contract = dict(schema="corridor_lookahead_happo_l0l5_v2", dispatch_protocol=DISPATCH_PROTOCOL, arms=ARMS,
+                    dispatch_sha=digest(Path(__file__).with_name("corridor_dispatch.py")),
                     shadow=dict(horizon=SHADOW_H, trajectories=SHADOW_N, warmup=WARM, replay_blocks=RING,
                                 samples_per_rollout=SAMPLES, fit_updates=48, fit_batch=256, rho_clip=1, c_clip=1), environment_sha=digest(Path(__file__).with_name("corridor_env.py")),
                     entry_sha=digest(Path(__file__)), configs={k: asdict(v) for k, v in configs.items()},
