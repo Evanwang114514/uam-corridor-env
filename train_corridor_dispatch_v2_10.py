@@ -19,6 +19,8 @@ SLOTS = 5
 BRANCH_HORIZON = 12
 SHADOW_MIX = .25
 BRANCHES_PER_ROLLOUT = 4
+RETRYABLE_ARMS = {"PR2_RESPONSE", "LA_EVENT_REPLAY", "LA_SELECTIVE"}
+RETRYABLE_ERROR = "could not broadcast input array from shape (5,1,5) into shape (5,1)"
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,48 @@ def jobs(lane, names=None):
             raise ValueError(f"不属于队列 {lane}：{sorted(unknown)}")
         arms = tuple(arm for arm in arms if arm.name in chosen)
     return [(arm, seed) for seed in SEEDS for arm in arms]
+
+
+def failed_jobs(source, lane, layer):
+    # 使用已经收尾的旧队列汇总，不在训练进行中截取一份不断变化的补跑名单。
+    manifest = source/"PROTOCOL.json"
+    summary = source/"SUMMARY.json"
+    try:
+        old_bytes, summary_bytes = manifest.read_bytes(), summary.read_bytes()
+    except FileNotFoundError as exc:
+        raise ValueError("旧队列尚未写出最终汇总，先等该队列退出") from exc
+    old, report = json.loads(old_bytes), json.loads(summary_bytes)
+    if (old.get("schema"), old.get("lane"), old.get("layer"), old.get("steps")) != (
+            "corridor_dispatch_v2_10_v1", lane, layer, STEPS):
+        raise ValueError("补跑来源的队列、物理层或预算不匹配")
+    planned = jobs(lane)
+    expected = {f"{layer}__{arm.name}__s{seed}" for arm, seed in planned}
+    old_plan = [dict(arm=asdict(arm), seed=seed) for arm, seed in planned]
+    cells = report["cells"]
+    by_id = {row["cell"]: row for row in cells}
+    if (old.get("cells") != old_plan or report.get("paused") is not False
+            or len(cells) != len(expected) or set(by_id) != expected):
+        raise ValueError("旧队列没有完成原计划的全部尝试，不能自动提取已确认失败的格子")
+    picked = []
+    for arm, seed in planned:
+        row = by_id[f"{layer}__{arm.name}__s{seed}"]
+        if row.get("state") != "FAILED" or row.get("evaluated_through_final"):
+            continue
+        if arm.name in RETRYABLE_ARMS and RETRYABLE_ERROR in row.get("error", ""):
+            picked.append((arm, seed))
+        else:
+            print(f"未纳入本补丁：{row['cell']}（不是已确认的动作形状错误）", file=sys.stderr)
+    return picked, old, dict(source=str(source), source_protocol_sha=hashlib.sha256(old_bytes).hexdigest(),
+                              source_summary_sha=hashlib.sha256(summary_bytes).hexdigest())
+
+
+def sample_action_columns(formal, behavior, n):
+    # HARL 采样返回 (N,1)，PyTorch 返回 (N,)；先对齐再算概率，避免跨环境广播。
+    action = behavior.sample().reshape(n)
+    pi, mu = formal.log_prob(action), behavior.log_prob(action)
+    if pi.shape != (n,) or mu.shape != (n,):
+        raise ValueError(f"每个并行环境只能返回一个动作概率：正式 {pi.shape}，行为 {mu.shape}")
+    return action[:, None], pi[:, None], mu[:, None]
 
 
 def committed_copy(env):
@@ -542,16 +586,15 @@ def roles_train(folder, a, arm, seed, cfg, rows, marks, env_cls, args, gym, np, 
                     mix = SHADOW_MIX*torch.as_tensor(opportunity[:, None], dtype=torch.float32, device=device)
                     mix_count[i] += int(opportunity.sum())
                     behavior = torch.distributions.Categorical(probs=(1-mix)*formal.probs+mix*future.probs)
-                act = behavior.sample()
-                pi, mu = formal.log_prob(act)[:, None], behavior.log_prob(act)[:, None]
+                act, pi, mu = sample_action_columns(formal, behavior, len(x))
                 ratio = (pi-mu).exp().cpu().numpy()
                 if classes is not None:
                     # 只用等价类质量修正 Critic；正式 Actor 始终用原始动作概率。
-                    index = act.cpu().numpy()[:, None]
+                    index = act.cpu().numpy()
                     p = class_mass(formal.probs.cpu().numpy(), classes, index, np)
                     q = class_mass(behavior.probs.cpu().numpy(), classes, index, np)
                     ratio = p/np.maximum(q, 1e-8)
-                return act[:, None], mu, pi.cpu().numpy(), ratio
+                return act, mu, pi.cpu().numpy(), ratio
 
             for k in range(b.LENGTH):
                 original = norm.get_original_obs()
@@ -718,7 +761,7 @@ def eval_arm(folder, a, arm, cfg, bank, marks, env_cls, args, np, torch):
     return results
 
 
-def execute(a, selected):
+def execute(a, selected, source_contract=None, retry=None):
     import gymnasium as gym
     import numpy as np
     import stable_baselines3 as sb3
@@ -756,6 +799,15 @@ def execute(a, selected):
                     files={p: b.digest(entry.with_name(p)) for p in (
                         entry.name, "corridor_env.py", "corridor_dispatch.py", "train_eval_corridor_uagmc_happo_mappo.py")})
     contract = json.loads(json.dumps(contract, sort_keys=True))
+    if source_contract is not None:
+        # 只允许入口文件变化；硬件范围、物理、需求、训练配置及三个依赖文件必须一致。
+        check = {k: v for k, v in contract.items() if k not in {"cells", "files"}}
+        changed = [k for k, value in check.items() if source_contract.get(k) != value]
+        changed.extend(k for k, value in contract["files"].items()
+                       if k != entry.name and source_contract["files"].get(k) != value)
+        if changed:
+            raise ValueError(f"补跑不能改变旧实验合同：{changed}")
+        contract["retry"] = retry
     failures = 0
     interrupted = False
     with b.lock_run(a.output):
@@ -809,23 +861,42 @@ def main(argv=None):
     parser.add_argument("--harl-dir", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
-    parser.add_argument("--only", nargs="+", help="仅执行指定方法；不能与完整矩阵混用输出目录")
+    selector = parser.add_mutually_exclusive_group()
+    selector.add_argument("--only", nargs="+", help="仅执行指定方法；不能与完整矩阵混用输出目录")
+    selector.add_argument("--retry-failed-from", type=Path, help="读取已收尾的旧队列，只补本补丁覆盖的失败格")
     a = parser.parse_args(argv)
     a.steps = STEPS
     assert all(len(arms) == SLOTS for arms in LANE.values())
     assert len({x.name for arms in LANE.values() for x in arms}) == 2*SLOTS
-    if a.plan:
+    old, retry = None, None
+    if a.retry_failed_from:
+        if not a.lane or not a.layer:
+            parser.error("补跑需要指定 --lane 和 --layer")
+        source = a.retry_failed_from.resolve()
+        if a.output:
+            target = a.output.resolve()
+            if target.is_relative_to(source) or source.is_relative_to(target):
+                parser.error("补跑必须使用独立输出目录，不改动旧实验")
+        try:
+            selected, old, retry = failed_jobs(source, a.lane, a.layer)
+        except (KeyError, OSError, ValueError) as e:
+            parser.error(str(e))
+        print("已确认的补跑格：" + (", ".join(f"{arm.name}/s{seed}" for arm, seed in selected) or "无"), flush=True)
+        if a.plan or not selected:
+            return 0
+    elif a.plan:
         print(json.dumps(dict(seeds=SEEDS, steps_per_cell=STEPS, steps_per_lane=SLOTS*len(SEEDS)*STEPS,
                               lanes={k: [asdict(x) for x in LANE[k]] for k in LANE if not a.lane or k == a.lane}),
                          ensure_ascii=False, indent=2))
         return 0
     if not all((a.lane, a.layer, a.config, a.train_trace, a.harl_dir, a.output)):
         parser.error("训练需指定队列、物理层、配置、需求、HARL 与输出目录")
-    try:
-        selected = jobs(a.lane, a.only)
-    except ValueError as e:
-        parser.error(str(e))
-    return execute(a, selected)
+    if old is None:
+        try:
+            selected = jobs(a.lane, a.only)
+        except ValueError as e:
+            parser.error(str(e))
+    return execute(a, selected, old, retry)
 
 
 if __name__ == "__main__":
