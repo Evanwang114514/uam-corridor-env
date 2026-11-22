@@ -70,6 +70,7 @@ def execution_class(gym, np, kind, plugin=None):
             # 以 drain 后的真实人数为积分区间左端；不读未来请求。
             e = self.env
             start = e.now
+            start_area = e.area_ticks
             ticks = e._ticks(self.c.decision_min)
             segments = {}
             drain = e._drain
@@ -85,11 +86,16 @@ def execution_class(gym, np, kind, plugin=None):
                 del e._drain
             counts = np.zeros(ticks, dtype=np.float32)
             active = 0
+            person_ticks = 0
             for k in range(e.now - start):
                 active = segments.get(start + k, active)
                 counts[k] = active
-            if abs(reward + counts.sum() * self.c.tick_min) > 1e-5:
-                raise RuntimeError("真实门到门人时积分不守恒")
+                person_ticks += int(active)
+            actual_ticks = e.area_ticks - start_area
+            if person_ticks != actual_ticks:
+                raise RuntimeError(f"真实门到门人时积分不守恒：重建={person_ticks}，环境={actual_ticks}，起止tick={start},{e.now}")
+            if abs(float(reward) + person_ticks * self.c.tick_min) > 1e-8:
+                raise RuntimeError(f"奖励与整数人时不符：reward={reward}，person_ticks={person_ticks}")
             info["active_path"] = counts
             return obs, reward, done, cutoff, info
 
@@ -232,6 +238,35 @@ def run(arms, script, argv=None, model_factory=None, fit_factory=None, imagine_f
     script = Path(script).resolve()
     ns.update(ARMS=arms, __file__=str(script))
 
+    def safe_close(vector):
+        # 异常清理只终止此向量环境自己创建的子进程，绝不扫描或终止他人进程。
+        import sys
+        if sys.exc_info()[0] is None:
+            return vector.close()
+        vec = getattr(vector, "venv", vector)
+        for process in getattr(vec, "processes", ()):
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=2)
+        for remote in getattr(vec, "remotes", ()):
+            remote.close()
+        vec.closed = True
+
+    def approve_repair(path, canonical):
+        # 只接受本次已审计旧版本的两项代码指纹迁移，其他合同必须逐项相同。
+        old = legacy.read(path)
+        known = {"d3b7d0253f96a1ac87bd17418331e342daf5e142032b745dd5abcb7fe9a98027",
+                 "83dfdb0239410e809532769644dacb19135bcceef547142134d4d6ea2e3541b8"}
+        changed = {k for k in set(old) | set(canonical) if old.get(k) != canonical.get(k)}
+        if not changed <= {"core_sha", "entry_sha"} or old.get("core_sha") not in known:
+            raise ValueError(f"修复续训不能更改其他合同：{sorted(changed)}")
+        audit = path.with_name("PERSON_TIME_REPAIR.json")
+        if not audit.exists():
+            legacy.save(audit, dict(original_protocol=old, repaired_protocol=canonical,
+                                   reason="整数人时校验替代float32校验；异常退出回收自有仿真进程"))
+
+    ns.update(safe_close=safe_close, approve_repair=approve_repair)
+
     def build_pair(args, space, action_space, device):
         if plugin:
             return plugin.build_pair(args, space, action_space, device, scope["kind"])
@@ -313,6 +348,8 @@ def run(arms, script, argv=None, model_factory=None, fit_factory=None, imagine_f
             return imagine_factory(imaginer, scope["kind"], *args)
         ns["imagine"] = imagine
     trainer = patch(legacy.train_cell, ns, [
+        ("        (norm if norm is not None else vec).close()",
+         "        safe_close(norm if norm is not None else vec)"),
         ("        depth, use_shadow, use_vtrace = ARMS[arm]",
          '''        depth,use_shadow,use_vtrace = ARMS[arm]
         replay_needed=bool(depth or arm=="I2_CLL")'''),
@@ -445,6 +482,8 @@ def run(arms, script, argv=None, model_factory=None, fit_factory=None, imagine_f
         ('[(name, "L0_HAPPO") for name in ARMS if name != "L0_HAPPO"] + [\n                ("L1_FULL","L5_NO_VTRACE"), ("L5_NO_VTRACE","L4_DISCARD_SHADOW")]', '[(name,"F_FULL") for name in ARMS if name!="F_FULL"]'),
     ])
     entry = patch(legacy.main, ns, [
+        ('            raise ValueError("当前配置、版本或需求与既有输出不一致，请使用新输出路径")',
+         '            approve_repair(path, canonical)'),
         ("a = p.parse_args(argv)", 'a = p.parse_args(argv)\n    if a.layers != ["E2"] or a.steps != 1_996_800 or tuple(a.seeds) != (2101,2102,2103,2104):\n        p.error("正式合同固定 E2、四个配对种子及 1,996,800 真实步")'),
         ("default=tuple(LAYERS)", 'default=["E2"]'),
         ('schema="corridor_lookahead_happo_l0l5_v2"', 'schema="corridor_lookahead_phase_e2_v2", core_sha=core_sha, legacy_sha=legacy_sha'),
