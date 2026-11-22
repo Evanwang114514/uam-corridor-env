@@ -4,6 +4,7 @@ import csv
 from dataclasses import asdict, replace
 import hashlib
 import json
+import math
 from pathlib import Path
 from statistics import mean
 import sys
@@ -17,7 +18,14 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     for path in ("source", "config", "harl-dir", "output"):
         p.add_argument("--" + path, type=Path, required=True)
+    p.add_argument("--rates", type=float, nargs="+", default=[1.1, 1.2, 1.4, 1.6, 1.8])
+    p.add_argument("--methods", nargs="+", choices=("HAPPO", "MAPPO"), default=["HAPPO", "MAPPO"])
+    p.add_argument("--seeds", type=int, nargs="+", default=[2101, 2102])
     a = p.parse_args()
+    if any(not math.isfinite(v) or v <= 0 for v in a.rates) or len(set(a.rates)) != len(a.rates):
+        p.error("倍率须为不重复的有限正数")
+    if len(set(a.methods)) != len(a.methods) or len(set(a.seeds)) != len(a.seeds):
+        p.error("方法和种子不能重复")
     protocol = base.read(a.source / "PROTOCOL.json")
     code = Path(base.__file__).resolve().parent
     for key, name in (("entry_sha", Path(base.__file__).name),
@@ -40,10 +48,10 @@ def main():
         if hashlib.sha256(json.dumps([asdict(q) for q in rows], sort_keys=True).encode()).hexdigest() != item["sha256"]:
             p.error(f"需求存档校验失败：{name}")
         t0 = min(q.time_min for q in rows)
-        dense = validate_requests([replace(q, time_min=t0 + (q.time_min - t0) / 2) for q in rows])
-        if not 1 < len(rows) <= 300 or max(q.time_min for q in dense) == t0:
+        dense = {v: validate_requests([replace(q, time_min=t0 + (q.time_min - t0) / v) for q in rows]) for v in a.rates}
+        if not 1 < len(rows) <= 300 or any(max(q.time_min for q in d) >= cfg.cutoff_min for d in dense.values()):
             p.error(f"需求数量或时间范围不适合压力回放：{name}")
-        bank[name] = (validate_requests(rows), dense)
+        bank[name] = dense
     if not bank:
         p.error("缺少冻结的最终评估轨迹")
 
@@ -57,8 +65,9 @@ def main():
     env_class = base.build_gym(gym, np)
     args, _, vendor = base.harl_vendor(a.harl_dir.resolve(), np, torch)
     # 每格独立落盘；重跑只跳过相同回放合同下已完整写出的格。
-    arms = ("1x_original", "2x_original", "1x_batch", "2x_batch")
+    arms = tuple(f"{v:g}x_batch" for v in a.rates)
     manifest = dict(source=str(a.source.resolve()), protocol=protocol, arms=arms,
+                    rates=a.rates, methods=a.methods, seeds=a.seeds,
                     evaluator_sha256=base.digest(Path(__file__)), device="cpu", policy_seeds=[123, 124, 125],
                     versions=dict(torch=str(torch.__version__), numpy=np.__version__, gymnasium=gym.__version__))
     a.output.mkdir(parents=True, exist_ok=True)
@@ -69,11 +78,11 @@ def main():
             p.error("输出目录已有不同的回放合同，请另选目录")
         base.save(path, manifest)
         base.save(a.output / "PAIRED_DEMAND.json", {
-            name: [[asdict(q) for q in rows] for rows in traces] for name, traces in bank.items()
+            name: {str(rate): [asdict(q) for q in rows] for rate, rows in traces.items()} for name, traces in bank.items()
         })
         all_rows, failures = [], 0
-        for method in ("HAPPO", "MAPPO"):
-            for seed in (2101, 2102):
+        for method in a.methods:
+            for seed in a.seeds:
                 cell = a.source / "cells" / f"E2__{method}__s{seed}"
                 out = a.output / "cells" / cell.name
                 try:
@@ -92,7 +101,7 @@ def main():
                             raise ValueError("源存档已改变，请换输出目录")
                         all_rows.extend(saved["rows"])
                         continue
-                    vec = DummyVecEnv([lambda: env_class(cfg, next(iter(bank.values()))[0], method)])
+                    vec = DummyVecEnv([lambda: env_class(cfg, next(iter(bank.values()))[a.rates[0]], method)])
                     norm = None
                     try:
                         norm = VecNormalize.load(str(norm_path), vec)
@@ -111,11 +120,11 @@ def main():
                             return int(action.item())
 
                         results = []
-                        for arm in arms:
+                        for rate, arm in zip(a.rates, arms):
                             for name, traces in bank.items():
                                 for policy_seed in (123, 124, 125):
                                     base.set_seed(policy_seed, np, torch)
-                                    env = env_class(cfg, traces[int(arm.startswith("2x"))], method)
+                                    env = env_class(cfg, traces[rate], method)
                                     x, _ = env.reset(seed=123)
                                     corridor = env.env
                                     peak = 0
