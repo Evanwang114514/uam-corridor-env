@@ -410,7 +410,7 @@ def load_adapter(group: Group, device: str, harl_dir: Path):
     if expected is not None and vendor != expected:
         raise ValueError("HARL 作者实现与存档不一致")
     if group.category == "old":
-        env_cls = batch_environment(common.build_gym(gym, np))
+        env_cls = common.build_gym(gym, np)
     else:
         import train_corridor_lookahead_core6 as core
         if group.category == "extension":
@@ -425,7 +425,8 @@ def load_adapter(group: Group, device: str, harl_dir: Path):
             raise ValueError("本格 HARL 文件指纹与当前作者实现不一致")
         if group.category == "old":
             backbone = "MAPPO" if job.method == "MAPPO_ROLE_CRITICS" else "HAPPO"
-            ctor = env_cls
+            # 旧入口返回工厂函数；从无请求、未 reset 的实例取真实类，不推进仿真。
+            ctor = batch_environment(type(env_cls(cfg, (), backbone)))
         else:
             backbone = "HAPPO"
             ctor = batch_environment(core.execution_class(gym, np, job.method, plugin))
