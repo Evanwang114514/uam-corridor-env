@@ -21,6 +21,18 @@ from types import SimpleNamespace
 from typing import Any
 
 VERSION = "corridor_pressure_eval_v2_batch"
+
+
+def matches_source_hash(path: Path, expected: str) -> bool:
+    """只允许 LF/CRLF 差异；保留编码、空格、注释和全部代码内容。"""
+    if not path.is_file():
+        return False
+    raw = path.read_bytes()
+    lf = raw.replace(b"\r\n", b"\n")
+    return expected.lower() in {
+        sha256(raw).hexdigest(), sha256(lf).hexdigest(),
+        sha256(lf.replace(b"\n", b"\r\n")).hexdigest(),
+    }
 # 固定本轮已经清点的 54 个存档，训练继续产生的新存档不会悄悄加入。
 SNAPSHOT = {
     **{k: (2101,2102,2103,2104) for k in (
@@ -370,13 +382,13 @@ def verify_code_provenance(group: Group) -> list[str]:
         if filename == "train_corridor_dispatch_v2_10.py":
             # 原始和修复批入口不同；其依赖物理和共同 Actor 入口仍严格校验。
             continue
-        if ref and (not actual.is_file() or checksum(actual) != ref):
+        if ref and not matches_source_hash(actual, ref):
             raise ValueError(f"{filename} 与来源 SHA256 不符，拒绝混用版本")
     if group.category != "old":
         for filename, key in (("train_eval_corridor_lookahead_l0l5.py","legacy_sha"),
                               ("train_corridor_lookahead_core6.py","core_sha")):
             ref = proto.get(key)
-            if ref and checksum(Path(__file__).with_name(filename)) != ref:
+            if ref and not matches_source_hash(Path(__file__).with_name(filename), ref):
                 raise ValueError(f"{filename} 与原训练实现不一致")
     return messages
 
