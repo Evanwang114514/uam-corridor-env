@@ -200,7 +200,21 @@ def load_model_context(a, seed, cfg, rows, legacy, np, torch, gym):
         actor.prep_rollout()
     critic.critic.load_state_dict(weights["critic"])
     critic.prep_rollout()
-    vn.load_state_dict(weights["value_norm"])
+    # CUDA 训练时统计张量可能未被注册；原训练器另存了完整统计，按原恢复语义加载。
+    stats = weights.get("value_statistics")
+    required = ("running_mean", "running_mean_sq", "debiasing_term")
+    if stats is not None:
+        if not isinstance(stats, dict) or set(stats) != set(required):
+            raise ValueError("价值归一化统计字段不完整，拒绝使用默认统计")
+        with torch.no_grad():
+            for key in required:
+                target = getattr(vn, key)
+                source = torch.as_tensor(stats[key], device=target.device, dtype=target.dtype)
+                if source.shape != target.shape or not torch.isfinite(source).all():
+                    raise ValueError(f"价值归一化统计形状或数值异常：{key}")
+                target.copy_(source)
+    else:
+        vn.load_state_dict(weights["value_norm"])
     z = np.zeros((1, 1, 128), dtype=np.float32)
     masks = np.ones((1, 1), dtype=np.float32)
     return dict(norm=norm, actors=pair, critic=critic, vn=vn,
@@ -285,7 +299,11 @@ def roll_branch(state, ctx, demand, seed, target_role, first,
             raw = env.care_obs
             vals, _ = ctx["critic"].get_values(normal_obs(ctx, raw, np)[None],
                                                  ctx["zeros"], ctx["masks"])
-            v = float(ctx["vn"].denormalize(vals).detach().cpu().numpy().reshape(-1)[0])
+            # HARL 原版返回 NumPy 数组，同时兼容返回张量的实现。
+            restored = ctx["vn"].denormalize(vals)
+            if torch.is_tensor(restored):
+                restored = restored.detach().cpu().numpy()
+            v = float(np.asarray(restored).reshape(-1)[0])
         utility += power * v
     if trajectory_one_min is None:
         trajectory_one_min = normal_obs(ctx, env.care_obs, np)
