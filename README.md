@@ -56,9 +56,9 @@ ACAC 是本研究目前最重要的异步多智能体强化学习方法。该算
 
 研究 Agent 经过多个物理时间步后才获得下一次合法决策机会的情况。例如，飞机在飞行、周转或等待期间无法立即进行新的重定位决策，但系统中的乘客需求和其他 Agent 的行为仍然在持续变化。重点研究两次有效决策之间的历史信息如何更新，以及如何进行跨时间的价值估计。
 
-- **决策间隔中的物理历史演化（Time-aware History Evolution）：** 研究 GRU 等历史编码器如何处理两次决策之间的时间间隔，以及期间发生的物理状态变化。不仅考虑决策间隔 \\(\Delta t\\)，还考虑期间的状态变化 \\(\Delta X^{phys}\\)，避免仅根据相邻两次决策观测推断系统演化。
+- **决策间隔中的物理历史演化（Time-aware History Evolution）：** 研究 GRU 等历史编码器如何处理两次决策之间的时间间隔，以及期间发生的物理状态变化。不仅考虑决策间隔 $\Delta t$，还考虑期间的状态变化 $\Delta X^{phys}$，避免仅根据相邻两次决策观测推断系统演化。
 - **决策间隔中的队友行为（Cross-agent Event History）：** 记录一个 Agent 暂时没有决策机会时，其他 Agent 在此期间执行的动作、发生时间及其造成的状态变化，使低频 Agent 在重新获得决策机会时能够利用相关的队友历史信息。训练阶段可以利用集中式信息辅助价值估计，但不能让分散执行的 Actor 使用实际不可获得的信息。
-- **异步信用分配（Multi-clock Credit Assignment）：** 研究 ACAC 原有 Global Macro-GAE 是否适合不同决策频率的 Agent，并比较 Global Macro-GAE、Agent-centric GAE 和 Dual-clock GAE。重点分析物理时间折扣因子 \\(\gamma\\) 与优势传播参数 \\(\lambda\\) 是否应该采用不同的时间尺度，研究全局事件数量和 Agent 自身决策次数对长期信用传播的影响。
+- **异步信用分配（Multi-clock Credit Assignment）：** 研究 ACAC 原有 Global Macro-GAE 是否适合不同决策频率的 Agent，并比较 Global Macro-GAE、Agent-centric GAE 和 Dual-clock GAE。重点分析物理时间折扣因子 $\gamma$ 与优势传播参数 $\lambda$ 是否应该采用不同的时间尺度，研究全局事件数量和 Agent 自身决策次数对长期信用传播的影响。
 
 在上述研究中，还需要明确区分三种情况：没有获得合法决策机会、获得机会但选择不行动、获得机会并执行有效动作。进一步研究决策机会是由外部事件产生，还是受到其他 Agent 行为影响，避免将三种情况统一处理为无效动作或 Padding。
 
@@ -84,11 +84,21 @@ ACAC 是本研究目前最重要的异步多智能体强化学习方法。该算
 
 整个系统以乘客门到门平均出行时间（ATT）为统一优化目标：
 
-\\[ ATT=\frac{1}{N}\sum\_{p=1}^{N}T_p \\]
+```math
+\mathrm{ATT} = \frac{1}{N}\sum_{p=1}^{N} T_p
+```
 
 其中，每名乘客的完整出行时间包括：
 
-\\[ \begin{aligned} T_p={}&T\_{\mathrm{接驳等待}} +T\_{\mathrm{CAV空驶接客}}\\\ &+T\_{\mathrm{CAV载客行驶}} +T\_{\mathrm{机场等待}}\\\ &+T\_{\mathrm{飞行}} +T\_{\mathrm{最终离站}} \end{aligned} \\]
+```math
+\begin{aligned}
+T_p ={}& T_{\mathrm{pickup\ wait}} + T_{\mathrm{CAV\ empty}} \\
+       &+ T_{\mathrm{CAV\ loaded}} + T_{\mathrm{vertiport\ wait}} \\
+       &+ T_{\mathrm{flight}} + T_{\mathrm{egress}}.
+\end{aligned}
+```
+
+六项依次为：接驳等待、CAV 空驶接客、CAV 载客行驶、机场等待、飞行和最终离站。
 
 ## **四、实验基线、方法对照与阶段性成果**
 
