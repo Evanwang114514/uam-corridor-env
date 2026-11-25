@@ -1,80 +1,188 @@
-# 独立 UAM 走廊环境
+# **UAM 联合调度与异步多智能体强化学习研究 README**
 
-单独运行环境仅依赖 Python 3.10+ 标准库。共享起降位沿用历史 Vertiport5Env 的双端同步预约逻辑；固定机队和响应式回流沿用旧闭环定义。环境提供门到门时钟、容量开关及命令行。训练为独立入口，使用固定 HARL 作者源码和原服务器项目环境；源码包不包含模型权重。
+**Research on Joint UAM Scheduling and Asynchronous Multi-Agent Reinforcement Learning**
 
-## Windows CMD
+## **一、研究背景与交通环境**
 
-```cmd
-cd /d "C:\Users\w\Documents\Codex\2026-08-05\re\workspace\projects\uam-corridor-env"
-conda activate uam5070
-set "PYTHONUTF8=1"
-python -B corridor_env.py --help
-python -B corridor_env.py --geometry
-```
+本研究围绕城市空中交通（Urban Air Mobility, UAM）中的乘客出发站选择与航空器重定位联合调度问题展开，核心是将乘客侧的出发站分配决策与航空器侧的跨站重定位决策纳入同一个动态决策框架，研究两类决策之间的相互影响及其协同优化机制。乘客选择不同出发站会改变各站点未来的需求分布，而航空器重定位则直接影响不同站点的可用运力，两者共同决定乘客等待时间与系统整体服务效率。因此，本研究将乘客分配和飞机调度置于统一的交通状态、决策过程和奖励目标下进行联合建模，以固定机队和有限交通资源为约束，最小化乘客从出发地到最终目的地的门到门平均出行时间（Average Door-to-Door Travel Time, ATT）。项目以 UAGMC（Unified Air-Ground Mobility Coordination）为重要研究基础，完成其原有联合调度框架的完整复现，并在此基础上建立面向多智能体强化学习的统一实验框架，重点研究不同决策主体如何通过策略交互实现乘客需求与航空器服务能力的动态匹配。
 
-默认只打印实际配置、机队分配和需求摘要；加 `--geometry` 只计算 CAV 直达和无排队 UAM，不跑回合或训练。用 `--save-config 文件.json` 保存可重载的配置（不会覆盖已有文件），`--config 文件.json` 加载；CMD 参数优先。配置与需求分别输出 SHA-256。
+当前 E2 主实验采用三个出发站 V0、V1、V3 和一个目的站 V2，配置固定规模的 eVTOL 机队，并通过调整乘客需求压力构建 1.0×、1.1×、1.2×、1.3×、1.4× 五档实验环境。系统采用分钟级策略决策与更细粒度物理状态推进相结合的运行方式。在每个决策周期内，Passenger Agent 根据当前需求和交通状态选择乘客出发站，Aircraft Agent 则根据航空器位置、可用状态及各站点运力需求决定重定位行为。两类决策共同改变后续系统状态：乘客分配影响各站点的待服务需求，航空器重定位改变未来可提供的运输能力，而航空器的飞行、周转和机场资源占用又进一步影响后续乘客的等待与服务过程。由此形成乘客分配与飞机重定位相互耦合的闭环调度系统。最终评价统一考虑乘客地面接驳、出发站等待、航空器服务、空中飞行及最终离站过程，以完整门到门 ATT 衡量联合调度策略的整体性能。
 
-### 八组基线（K3）
+## **二、人工智能算法与核心方法**
 
-```cmd
-python -B -u corridor_env.py --baselines --baseline-output "workspace\artifacts\corridor_k3_base_s123"
-python -B -u corridor_env.py --baselines --baseline-output "workspace\artifacts\corridor_k3_tlof1_chargers2_s123" --tlof on --station-set all:pads:1 --finite-charging on --station-set all:chargers:2
-```
+**1. MAPPO（Multi-Agent Proximal Policy Optimization）。**
 
-每条命令运行同一个物理配置下的八组，共用一次生成的需求；切换容量或需求种子时另用结果目录。初始机队按环境设置给四条规则，默认是均分。三个集中组把整支初始机队和乘客**选站**集中到同一个出发站，乘客的真实起终点保持不变。七个航空组都用环境的最长队调机。另有一组 `CAV_DIRECT`，在需求揭示后从真实起点开到真实终点，速度由 `--cav-kmh` 控制，无候车或道路拥堵，也不用机场或飞机。它沿用相同的时间步、截止及完成率口径，即使航空关闭末段，也始终到真实终点才算完成。换 K5 会得到四条规则 + 五个逐站集中组 + 一组 CAV。
+MAPPO 是本研究的基础多智能体强化学习算法，采用集中训练、分散执行（Centralized Training with Decentralized Execution, CTDE）框架，通过集中式 Critic 利用全局状态信息估计团队价值，并使用 PPO 的裁剪策略目标更新 Actor。其优势在于训练机制相对稳定、实现简洁，适合作为 Passenger 与 Aircraft 联合调度任务的基础算法。我们已完成 MAPPO 在 UAM 环境中的迁移与训练，并将其作为后续 ACAC 机制适配和异步 MARL 方法研究的主要对照基线。
 
-- SPF_SRC 保留“较低权重的地面时间 + 估计排队”，不是纯就近。STTF 保留“地面时间 + 估计排队”，QTTI 在此基础上加已路由、仍在接驳途中的乘客拥堵项。旧规则的服务率与 QTTI 分母默认是 3 人/分钟、V0=30/其余站=6，可分别用 `--rule-service-rates` 和 `--qtti-denominators` 逐站覆盖；这些是规则参数，不改变实际服务能力。
-- READY 按新版的接驳时间、在途已选站乘客、可用/正在充电飞机和往返时间作近似，不偷看未来请求，也不解资源预约的最优调度。四条规则保留昨天的打分结构，但用新版时间和飞机生命周期，不应当作旧 E1 的逐数值复现。
-- 停车位不足以容纳集中机队时，该组为 `INFEASIBLE`，不会私自增加停车位或把飞机放到别站；已运行但截至上限仍未全完成则标为 `CENSORED`，不填写全体 ATT/AWT。完成率与固定截止人时以**已生成**乘客为分母；输出同时列出计划人数。
-- `summary.csv` 汇总指标（CAV 车程单列 `cav_drive_min_per_generated`），`manifest.json` 记录配置、需求哈希、代码哈希和规则参数，`arm_*.json` 记录各组分段、选站计数及飞机诊断。中断后同一命令可以继续，已结算组不会重复跑；原七组跑过的目录不覆盖，八组另开目录。避免让两个进程同时写同一个结果目录。
+论文：Yu et al., *The Surprising Effectiveness of PPO in Cooperative Multi-Agent Games*, NeurIPS 2022。
 
-### 地图和物理参数
+[论文原文（NeurIPS 2022）](https://proceedings.neurips.cc/paper_files/paper/2022/hash/9c1535a02f0ce079433344e14d910597-Abstract-Conference.html?utm_source=chatgpt.com)
 
-```cmd
-python -B corridor_env.py --destination-shift-km 15 --time-scale 0.5 --tlof on --station-set V1:pads:2 --turnaround on --finite-stands on --station-set all:turnaround_min:3 --finite-charging on --station-set V1:chargers:4 --geometry
-```
+**2. HAPPO（Heterogeneous-Agent Proximal Policy Optimization）。**
 
-此例把目的站及终点区向东移 15 km；相对于同地图、同种子、原速率的设置，到达间隔减半时 OD 与顺序保持不变。固定 CSV 列为 `id,time_min,origin_x,origin_y,dest_x,dest_y`（也接受 `time` 作为分钟列），可用 `--time-scale` 缩放时间，但不会自动改写其 OD。
+HAPPO 面向异构智能体协作问题，其核心是 Multi-Agent Advantage Decomposition（多智能体优势分解）与序贯策略更新机制，通过依次更新不同 Agent 的策略，处理异构主体之间的策略依赖关系。与普通 MAPPO 相比，HAPPO 更强调不同智能体策略更新顺序对联合策略优化的影响。我们已将 HAPPO 迁移至 UAM 联合调度环境，用于研究 Passenger 与 Aircraft 在不同决策职责和动作空间下的协作学习表现。当前实验发现，HAPPO 在低需求压力下与 MAPPO 表现接近，但随着需求压力增加，其性能退化更加明显，在 1.3× 和 1.4× 下分别比 MAPPO 慢 3.58 和 5.37 分钟。这一现象为进一步研究异构 Agent 的决策频率、策略更新及协同机制提供了实验依据。
 
-| 可调内容 | 命令行 |
-|---|---|
-| 全部机场及角色 / 单站坐标 | 重复 `--station V0:departure:0:-8` 等来替换地图；`--station-position V1:-2:0` 只改一站 |
-| 起点与终点刷新区域 | `--origin-zone=-5,4,-12,12,1,uniform`、`--destination-zone=47,53,-4,4,1,uniform`，可重复；最后两个字段为权重与分布，支持 uniform / centered |
-| 机队与单机服务 | `--fleet 48 --seats 1 --boarding immediate`；集中布局 `--initial-fleet V1:48` |
-| 需求 | `--passengers 300 --arrival-min 1 --seed 123 --arrival-mode uniform`；也支持 varying、poisson 或固定 CSV |
-| 物理开关 | `--tlof`、`--operation-time`、`--turnaround`、`--finite-stands`、`--finite-charging`、`--parking`、`--energy`、`--egress` 均接受 on/off |
-| 按站或全网覆盖 | `--station-set V1:字段:值` / `--station-set all:字段:值` |
-| 调机 | `--reposition off/fixed/lq/manual`；固定回流可指定 `--fixed-returns V2:V1`；最长队和手动模式支持 `--lateral on` |
-| 时间、速度、比例尺 | `--tick-min`、`--decision-min`、`--cutoff-min`、`--access-kmh`、`--egress-kmh`、`--air-kmh`、`--cav-kmh`、`--km-per-unit` |
+论文：Kuba et al., *Heterogeneous-Agent Reinforcement Learning*, Journal of Machine Learning Research, 2024。
 
-机场字段：`pads`、`takeoff_min`、`landing_min`、`separation_min`、`stands`、`turnaround_min`、`chargers`、`charge_soc_per_min`（0–1 SOC/分钟）、`parking`。能耗可用 `--initial-soc`、`--reserve-soc`、`--target-soc`、`--fixed-flight-soc` 和 `--soc-per-km`。
+[论文 PDF（JMLR 2024）](https://www.jmlr.org/papers/volume25/23-0488/23-0488.pdf?utm_source=chatgpt.com)
 
-默认是待校准配置：三个出发站、一个到达站，48 架均分在出发站，单客、不凑批。末段、能量和起降耗时开启；TLOF 容量、周转、有限充电位、停车容量默认关闭。开启周转并不会自动加有限周转位；关闭有限充电位不会关闭能耗。关闭 TLOF 容量后不恢复旧的一站一分钟一架限制。TLOF 启用时起降占用同一组 Pad，间隔在占用结束后另计；停车位在承诺航班时保守预留，没有地面位就暂不派发，不模拟无限盘旋。
+**3. ACAC（Agent-Centric Actor-Critic）。**
 
-## 环境接口
+ACAC 是本研究目前最重要的异步多智能体强化学习方法。该算法针对不同 Agent 宏动作持续时间不同所引起的异步决策问题，提出 Agent-Centric History Encoder，分别维护和编码不同智能体的历史轨迹，并通过 Attention-based Centralized Critic 融合各 Agent 的历史信息，减少传统 Padding 方式可能引入的异步轨迹错位。同时，算法设计了适用于异步决策过程的 Macro-GAE，使价值估计与不同智能体的决策时间结构相匹配。其核心价值在于将不同 Agent 的独立历史建模与集中式价值评估结合起来，为异步 MARL 提供了一套 Actor-Critic 学习框架。
 
-- `parse_config(argv)` 提供同一套 CMD 参数解析，供后续独立入口使用。
-- `CorridorEnv(config).reset(requests=None)` 返回已揭示需求、已选站接驳人数、站点队列、飞机状态及资源占用，可传入固定 `Request` 列表。
-- `step(routes={乘客ID:出发站}, reposition={飞机ID:目标站})` 按决策间隔推进事件，返回 observation、reward、terminated、truncated、info。手动调机模式才接受飞机动作；省略乘客动作表示请求继续等待。固定回流未指定目标时使用排序后的第一个出发站。
-- `metrics()` 将等待拆成待选站、排队和待起飞，再独立记录首程、起飞、巡航、落地、末程。奖励为负的已生成未完成人时；只有计划请求全部完成且启用末段，才定义门到门 ATT。关闭末段的完成成绩单列到落地时间。
+论文：Jung et al., *Agent-Centric Actor-Critic for Asynchronous Multi-Agent Reinforcement Learning*, ICML 2025。
 
-验证代码：`python -B -m unittest -v test_corridor_env`。只测环境不变量。
+[论文原文（ICML 2025）](https://proceedings.mlr.press/v267/jung25a.html?utm_source=chatgpt.com) · [PDF 下载](https://raw.githubusercontent.com/mlresearch/v267/main/assets/jung25a/jung25a.pdf?utm_source=chatgpt.com)
 
-## 走廊 E2：Lookahead 14 组
+## **三、目前正在推进的研究方向**
 
-沿用调机已接通的 `old_minute_pre_dispatch_v2`：乘客选站→执行同一时刻的已知事件与载客→飞机回流优先站→推进一个真实分钟。两个角色的动作合计为一个真实步。使用仓库内冻结配置和训练 CSV，`--layers E2`，种子 2101–2104；每格 1,996,800 步，消融 24 格 / 47,923,200 步，扩展 32 格 / 63,897,600 步。沿用真实 HARL 随机顺序更新、学习率计划和评估银行。每个入口用独立输出目录，旧存档格式不兼容，不能续到新合同。
+### **1. 面向决策机会不对称与不规则性的多智能体强化学习**
 
-| 组 | 实际实现 |
-|---|---|
-| F | Gaussian NLL 分阶段动力学、正式团队复制后虚拟更新、影子行为采样、正式团队用 V-trace 与独立 PPO 权重学习 |
-| A1 / A2 | A1 只改为正式团队采样，仍运行虚拟更新；A2 只将价值与优势目标换为 GAE，保留实际行为概率和 actor 校正 |
-| A3 / A4 / A5 | A3 首次拟合后冻结模型；A4 连续动力学及奖励取均值；A5 不训练标量奖励头，预测十个子时段的人数后积分 |
-| P1 / P2 | P1 五成员 bootstrap Gaussian ensemble + TS∞，不做 PETS 的 CEM/MPC；P2 用 GRU 编码六帧、阶段、两个角色的动作历史 |
-| P3 / P4 | P3 用飞机、机场、队列、起降位、充电和已承诺事件做图消息传递，另监督下一事件类型及 ETA，图只进入世界模型；P4 用剥离真实未来请求的精确仿真器执行承诺，未知到达从已见回放估计，虚拟奖励仍为精确人时 |
-| T1 | 两角色的有向历史、自历史/邻居历史/同分钟边、时间注意力，进入动力学及影子和正式 Actor/Critic；保留 HAPPO，不声称复现 TIGER 原任务上的 value mixer |
-| I1 / I2 | 都用候选条件隐式表示，真实动作仍由正式策略采样。I1 学习实际下一次合法队友响应；I2 用已承诺快照做共享随机数配对，估计相对 V0 的隐式响应差分 |
-| C1 | 两轮影子更新，两个角色分别根据策略 KL 与训练回放留出误差决定混合系数；记录混合后的实际行为概率 |
+目前主要研究不同 Agent 在决策次数、决策间隔和决策顺序上存在差异时，如何提高多智能体强化学习的学习效率。现有 UAGMC 等分钟级交通调度框架及常规 PPO 类方法，通常按照统一物理时间步组织各智能体的策略输出，难以充分处理同一分钟内连续发生的多个有效决策；而对于连续多个物理时间步没有合法决策机会的 Agent，传统同步数据组织方式又容易通过 Padding 或无效动作进行时间对齐。ACAC 通过 Agent-Centric History、时间戳和 Macro-GAE 等机制，一定程度上解决了异步轨迹的历史组织和时间对齐问题，但对于瞬时决策场景中的多次连续决策，以及不同决策频率下的历史组织和信用分配，仍有进一步研究空间。
 
-方法来源：[Lookahead 原文，Algorithm 1 与 Appendix B.2](https://openreview.net/pdf/238ee2ba9b2e125d2a310e754b125d3bffdb15cd.pdf)、[PETS 原文](https://papers.neurips.cc/paper_files/paper/2018/hash/3de568f8597b94bda53149c7d7f5958c-Abstract.html)、[TIGER 原文](https://proceedings.mlr.press/v331/gupta26a.html)。本矩阵检验核心机制在走廊上的迁移，不等于重跑论文原任务、架构和超参数。I1/I2 是本项目实验方法。
+因此，我们希望从决策机会本身出发，研究不同决策密度下的历史表示、策略更新、价值估计和团队信用分配问题。按照决策机会的不同特征，将研究分为高频决策、低频决策和混合异步三个层次。
 
-用输出目录下的 `STOP_REQUESTED` 在更新边界暂停；移除后重跑相同命令。每格的临时失败落 `ERROR.json`，其余格继续。恢复快照包含真实模拟器状态和随机数，只进入续训文件，不进入反事实。两条队列评估用同一需求银行；比较扩展方法和 F 时按同环境、同种子、同评估轨迹配对。
+**（1）高频决策（High-Frequency Decision Making）**
+
+研究同一个 Agent 在一个物理时间步内连续获得多个有效决策机会的情况。例如，同一分钟内有多个乘客需要选择出发站，此时需要解决多个决策对象的历史组织、连续决策之间的状态依赖以及各动作对未来团队收益的贡献问题。
+
+- **物理历史与决策历史分解（Dual-stream History Representation）：** 将系统物理状态的变化与同一时间步内多个决策对象的信息分开组织。前者记录机场资源、飞机状态和系统需求等随物理时间变化的信息，后者记录当前决策对象及此前已经处理的对象和动作，避免不同乘客的决策信息与物理时间历史发生混淆。
+- **步内连续决策的序贯分配（Intra-step Sequential Decision）：** 借鉴 HAPPO 的序贯优势分解思想，研究同一 Agent 连续处理多个决策对象时，如何依次生成决策并更新后续决策的条件信息，使前一个动作对系统状态产生的影响能够被后续决策利用。
+- **步内连续决策的信用分配（Intra-step Credit Assignment）：** 研究同一物理时间内多个动作共同影响未来团队奖励时，如何估计每个原子决策的实际贡献，避免将多个动作简单赋予相同的整体优势。
+
+此外，将决策对象的顺序与排列不变性作为贯穿上述研究的约束，研究不同乘客处理顺序是否会造成明显的策略性能差异，避免模型学习到缺乏实际业务依据的对象 ID 优先级。
+
+**（2）低频决策（Low-Frequency Decision Making）**
+
+研究 Agent 经过多个物理时间步后才获得下一次合法决策机会的情况。例如，飞机在飞行、周转或等待期间无法立即进行新的重定位决策，但系统中的乘客需求和其他 Agent 的行为仍然在持续变化。重点研究两次有效决策之间的历史信息如何更新，以及如何进行跨时间的价值估计。
+
+- **决策间隔中的物理历史演化（Time-aware History Evolution）：** 研究 GRU 等历史编码器如何处理两次决策之间的时间间隔，以及期间发生的物理状态变化。不仅考虑决策间隔 \\(\Delta t\\)，还考虑期间的状态变化 \\(\Delta X^{phys}\\)，避免仅根据相邻两次决策观测推断系统演化。
+- **决策间隔中的队友行为（Cross-agent Event History）：** 记录一个 Agent 暂时没有决策机会时，其他 Agent 在此期间执行的动作、发生时间及其造成的状态变化，使低频 Agent 在重新获得决策机会时能够利用相关的队友历史信息。训练阶段可以利用集中式信息辅助价值估计，但不能让分散执行的 Actor 使用实际不可获得的信息。
+- **异步信用分配（Multi-clock Credit Assignment）：** 研究 ACAC 原有 Global Macro-GAE 是否适合不同决策频率的 Agent，并比较 Global Macro-GAE、Agent-centric GAE 和 Dual-clock GAE。重点分析物理时间折扣因子 \\(\gamma\\) 与优势传播参数 \\(\lambda\\) 是否应该采用不同的时间尺度，研究全局事件数量和 Agent 自身决策次数对长期信用传播的影响。
+
+在上述研究中，还需要明确区分三种情况：没有获得合法决策机会、获得机会但选择不行动、获得机会并执行有效动作。进一步研究决策机会是由外部事件产生，还是受到其他 Agent 行为影响，避免将三种情况统一处理为无效动作或 Padding。
+
+**（3）混合异步（Mixed Asynchronous Decision Making）**
+
+在高频和低频决策同时存在的情况下，研究不同 Agent 的决策机会、历史信息和团队收益之间的相互影响。例如，乘客选站 Agent 可能在同一分钟内连续处理多个乘客，而飞机重定位 Agent 可能经过数分钟才获得一次新的合法决策机会。后续将结合前两个方向的研究成果，重点推进：
+
+- **跨角色历史融合：** 统一组织不同 Agent 的物理历史、决策历史及其间发生的队友事件。
+- **多时钟价值估计：** 同时考虑物理时间、Agent 自身决策时间和跨角色事件，建立适应不同决策频率的价值估计机制。
+- **统一信用分配：** 将同一物理时间内的连续决策与跨多个物理时间步的稀疏决策纳入统一的团队收益分配框架。
+
+最终希望形成面向决策机会不对称与不规则性的统一异步 Actor-Critic 方法，使不同 Agent 在决策次数、时间间隔和决策顺序存在差异时，仍然能够有效组织历史信息、估计团队价值并完成信用分配。
+
+### **2. 面向地空协同的 CAV–UAM 综合交通环境**
+
+在原有 UAM 环境基础上，我们正在引入自动驾驶车辆（Connected and Automated Vehicles, CAV）地面接驳系统，将原来的乘客选站与飞机重定位联合调度扩展为地面接驳、乘客分配和航空器调度三个主体协同的综合交通系统。CAV 速度设置为 40 km/h，eVTOL 飞行速度为 200 km/h，两类交通工具均采用单座服务，不引入拼车，并设置有限车队规模。系统主要包含三个决策 Agent：
+
+- **乘客选站 Agent（Passenger Selection Agent）：** 乘客产生出行请求后，由该 Agent 根据各出发站的需求和交通状态选择乘客的出发站，决定后续地面接驳目的地。
+- **CAV 接客调度 Agent（CAV Dispatch Agent）：** 负责地面车辆派单。CAV 完成上一项任务并重新空闲后，从待服务乘客队列中选择乘客，安排车辆空驶接客，再将乘客送往其选定的出发站。车辆的任务完成时间及乘客抵达时间由车辆当前位置、任务队列和行驶距离共同决定。
+- **飞机重定位 Agent（Aircraft Repositioning Agent）：** 根据各出发站的航空器分布、乘客需求和飞机可用状态，决定空闲飞机是否需要跨站重定位，使航空运力能够适应不同站点的需求变化，同时满足飞机周转、起降资源及充电等约束。
+
+三个 Agent 通过乘客需求、车辆接驳和航空器运力形成闭环协作：乘客首先选择出发站，CAV 负责将其接驳至相应站点，乘客抵达后进入候机队列，航空器在具备服务条件时完成运输，而飞机重定位则持续调整各站点的未来可用运力。
+
+整个系统以乘客门到门平均出行时间（ATT）为统一优化目标：
+
+\\[ ATT=\frac{1}{N}\sum\_{p=1}^{N}T_p \\]
+
+其中，每名乘客的完整出行时间包括：
+
+\\[ \begin{aligned} T_p={}&T\_{\mathrm{接驳等待}} +T\_{\mathrm{CAV空驶接客}}\\\ &+T\_{\mathrm{CAV载客行驶}} +T\_{\mathrm{机场等待}}\\\ &+T\_{\mathrm{飞行}} +T\_{\mathrm{最终离站}} \end{aligned} \\]
+
+## **四、实验基线、方法对照与阶段性成果**
+
+**1. UAGMC 交通环境与调度机制复现。**
+
+已完成 UAGMC 原始交通环境、核心调度流程及主要算法机制的完整复现，并在此基础上建立当前统一的 UAM 联合调度实验框架。通过对乘客出发站选择、航空器服务和调度流程进行复现，形成了可用于后续算法迁移、机制对照和独立方法研究的实验基础。UAGMC 同时作为重要的原始对照工作保留，后续研究将进一步围绕决策机会结构、历史表示及异步信用分配展开，而不局限于对原始调度策略的简单改进。
+
+**2. MAPPO 与 HAPPO 的环境迁移。**
+
+已完成 MAPPO 和 HAPPO 在 UAM 联合调度环境中的迁移与训练，建立四训练种子的学习基线，并统一采用门到门 ATT 作为主要评价指标。相关实验覆盖五档需求压力，能够比较不同 MARL 更新机制在需求增长情况下的性能变化。其中 MAPPO 作为基础 CTDE 对照，HAPPO 则用于验证异构 Agent 序贯更新和优势分解机制在 UAM 场景中的适用性。
+
+实验结果显示，两种算法在低需求压力下表现接近，但 HAPPO 随需求压力上升出现了更明显的性能退化：
+
+- **低压力环境（1.0×–1.1×）：** HAPPO 与 MAPPO 基本持平，ATT 分别为 38.60 和 50.65 分钟。
+- **中高压力环境（1.2×–1.3×）：** HAPPO 开始明显落后于 MAPPO，1.3× 时 ATT 达到 77.95 分钟，比 MAPPO 高 3.58 分钟。
+- **高压力环境（1.4×）：** HAPPO 的 ATT 达到 89.09 分钟，比 MAPPO 高 5.37 分钟。
+
+这一结果表明，HAPPO 的异构 Agent 序贯更新机制并未在当前 UAM 任务中带来预期的高压力性能优势，反而表现出更明显的压力敏感性，值得进一步从策略更新、决策机会和跨角色协同等方面分析。
+
+**3. ACAC 算法的 UAM 适配版与未适配版实现及实验验证。**
+
+在完成 MAPPO 和 HAPPO 环境迁移后，我们进一步围绕 ACAC 开展算法研究，分别实现了面向 UAM 决策特点进行机制适配的 ACAC-UAM 适配版，以及直接采用 ACAC 原有算法机制、不进行 UAM 专门适配的 ACAC 未适配版。两种实现分别对应任务适配与原始机制直接应用两条路径，均完成独立训练和五档需求压力评估。
+
+- **ACAC-UAM 适配版：** 以 MAPPO 为基础，将 ACAC 的核心机制融入 UAM 原有分钟级决策接口，引入 Agent-Centric History、时间编码、注意力历史融合及异步信用分配机制。完成 Full、NoTE、NoSA 和 Micro-GAE 四臂消融实验，每种方法均使用 2101–2104 四个训练种子，并完成五档需求压力回放。
+- **ACAC 未适配版：** 直接采用 ACAC 原有算法机制，不针对 UAM 的分钟级决策接口及乘客、飞机的具体决策特点进行额外适配，保留 Agent-Centric History、时间编码、Attention-based Critic 和 Macro-GAE 等核心设计。完成独立的四种子训练，并在相同 UAM 环境下进行五档需求压力评估。
+- **两种实现的对照目的：** 通过将两种实现同时纳入 E2 主对照，研究 ACAC 原始机制直接应用与面向具体交通任务进行机制适配之间的性能差异，分析不同算法组织方式在 UAM 联合调度任务中的适用性。
+
+**4. E2 主对照实验：五个规则基线与五个学习方法。**
+
+下表报告不同需求压力下的门到门 ATT，单位为分钟，数值越低越好。学习方法的 `±` 为训练种子间的样本标准差；规则基线为同档四条需求轨迹的均值。
+
+| 方法                             | 1.0×             | 1.1×             | 1.2×             | 1.3×             | 1.4×             |
+| ------------------------------ | ---------------- | ---------------- | ---------------- | ---------------- | ---------------- |
+| SPF_SRC                        | 71.52            | 93.54            | 95.87            | 101.14           | 119.95           |
+| STTF                           | 86.95            | 91.88            | 104.15           | 113.55           | 121.68           |
+| QTTI                           | 72.74            | 85.59            | 99.98            | 107.42           | 112.31           |
+| READY                          | 53.07            | 74.35            | 91.14            | 117.18           | 124.64           |
+| BOTH_V0（池化）                    | 81.22            | 93.08            | 102.06           | 109.34           | 118.98           |
+| HAPPO（4 seeds）                 | 38.60 ± 0.51     | 50.65 ± 0.36     | 65.08 ± 2.72     | 77.95 ± 2.40     | 89.09 ± 4.46     |
+| MAPPO（4 seeds）                 | 38.52 ± 0.55     | 50.69 ± 0.92     | 63.28 ± 1.22     | 74.37 ± 2.09     | 83.72 ± 2.33     |
+| UAGMC_AIR（含调机，2 seeds）         | 54.36 ± 5.70     | 64.97 ± 5.47     | 79.22 ± 0.66     | 89.85 ± 3.15     | 103.49 ± 5.92    |
+| **ACAC-UAM 适配版 Full（4 seeds）** | **38.13 ± 0.56** | **50.45 ± 0.91** | **62.74 ± 1.39** | **72.69 ± 1.84** | **81.37 ± 2.70** |
+| ACAC 未适配版 Full（4 seeds）        | 40.14 ± 1.28     | 52.33 ± 1.06     | 63.47 ± 1.38     | 73.50 ± 0.62     | 83.34 ± 2.85     |
+
+主要实验发现：
+
+- **ACAC-UAM 适配版的整体表现：** Full 在五档需求压力下均为表内表现最好的学习方法，相较普通 MAPPO，其 ATT 分别改善 0.39、0.24、0.54、1.68 和 2.35 分钟，改善幅度在高压力环境下更加明显。
+- **适配版与未适配版的差异：** ACAC-UAM 适配版在五档压力下均优于 ACAC 未适配版，分别改善 2.01、1.88、0.73、0.81 和 1.97 分钟。这一结果初步说明，针对具体交通任务进行机制适配具有实际价值，但两种实现涉及多个算法组织差异，不能仅凭端到端成绩将性能差异归因于某个单独组件。
+- **HAPPO 的高压退化：** HAPPO 在 1.3× 和 1.4× 下分别比 MAPPO 慢 3.58 和 5.37 分钟，说明其在当前环境中表现出更明显的高需求压力敏感性。
+- **规则基线的压力变化：** READY 在 1.0×、1.1× 和 1.2× 下表现最好；1.3× 时 SPF_SRC 最好；1.4× 时 QTTI 最好。不同规则策略在需求增长过程中表现出不同的适用范围。
+
+**5. ACAC-UAM 适配版的四臂消融实验。**
+
+下表单独呈现 ACAC-UAM 适配版的 Full 与三个消融方法，并保留普通 MAPPO 作为参照。所有方法均使用 2101–2104 四个训练种子，五档需求压力下均完成全部乘客服务。这里不加入 ACAC 未适配版的结果，以保证消融实验对应同一套算法实现。
+
+| 方法          | 1.0×             | 1.1×             | 1.2×             | 1.3×             | 1.4×             |
+| ----------- | ---------------- | ---------------- | ---------------- | ---------------- | ---------------- |
+| 普通 MAPPO    | 38.52 ± 0.55     | 50.69 ± 0.92     | 63.28 ± 1.22     | 74.37 ± 2.09     | 83.72 ± 2.33     |
+| **Full**    | 38.13 ± 0.56     | 50.45 ± 0.91     | **62.74 ± 1.39** | **72.69 ± 1.84** | **81.37 ± 2.70** |
+| NoTE（去时间编码） | **37.96 ± 0.38** | **50.02 ± 0.81** | 63.82 ± 2.34     | 78.43 ± 5.19     | 89.46 ± 7.81     |
+| NoSA        | 38.58 ± 1.27     | 50.59 ± 0.78     | 63.22 ± 2.14     | 74.69 ± 4.02     | 85.74 ± 5.66     |
+| Micro-GAE   | 40.79 ± 0.98     | 52.37 ± 0.31     | 65.70 ± 1.40     | 76.90 ± 1.72     | 86.77 ± 1.85     |
+
+主要消融发现：
+
+- **Full 的高压优势：** ACAC-UAM 适配版 Full 在 1.2×、1.3× 和 1.4× 下均优于普通 MAPPO，其中 1.3× 和 1.4× 分别改善 1.68 和 2.35 分钟，说明当前完整机制在较高需求压力下具有更明显的性能优势。
+- **时间编码（NoTE）：** 去除时间编码后，算法在 1.0× 和 1.1× 下反而略有改善，但在 1.2×、1.3× 和 1.4× 下明显退化。尤其在 1.4× 下，NoTE 比 Full 慢 8.09 分钟。这说明时间编码的价值具有需求压力依赖性，在高压力环境下更加重要。
+- **注意力融合（NoSA）：** 去除注意力历史融合后，低压力下性能变化较小，但在高压力下退化更加明显。1.4× 下 NoSA 比 Full 慢 4.37 分钟，说明历史信息融合机制在当前高压力设置中具有一定作用。
+- **异步信用分配（Micro-GAE）：** Micro-GAE 在五档需求压力下均落后于 Full，1.4× 下差距达到 5.40 分钟。这表明当前完整信用估计机制在该实验设置中具有性能价值，值得进一步研究其与不同决策频率、历史表示之间的关系。
+
+整体来看，四臂消融结果表明，时间编码、注意力历史融合和信用估计机制的作用并不完全相同，且受到需求压力影响。其中时间编码在高压力环境下表现出较明显的作用，Micro-GAE 的替换则在五档压力下均造成性能下降。这些结果为后续进一步研究历史表示与异步信用分配提供了实验依据。
+
+## **五、参考文献**
+
+[1] Pang, A., Wang, M., Sha, Z., Yue, W., Li, C., Chen, C. S., and Pun, M. O. *Heterogeneous Vertiport Selection Optimization for On-Demand Air Taxi Services: A Deep Reinforcement Learning Approach*. IEEE Transactions on Intelligent Transportation Systems, 2026.
+
+[DOI 链接](https://doi.org/10.1109/TITS.2026.3680351?utm_source=chatgpt.com)
+
+[2] Yu, C., Velu, A., Vinitsky, E., Gao, J., Wang, Y., Bayen, A., and Wu, Y. *The Surprising Effectiveness of PPO in Cooperative Multi-Agent Games*. Advances in Neural Information Processing Systems (NeurIPS), 2022.
+
+[论文原文](https://proceedings.neurips.cc/paper_files/paper/2022/hash/9c1535a02f0ce079433344e14d910597-Abstract-Conference.html?utm_source=chatgpt.com)
+
+[3] Kuba, J. G., et al. *Heterogeneous-Agent Reinforcement Learning*. Journal of Machine Learning Research, 2024.
+
+[论文 PDF](https://www.jmlr.org/papers/volume25/23-0488/23-0488.pdf?utm_source=chatgpt.com)
+
+[4] Jung, W., et al. *Agent-Centric Actor-Critic for Asynchronous Multi-Agent Reinforcement Learning*. Proceedings of the 42nd International Conference on Machine Learning (ICML), PMLR 267, 2025.
+
+[论文原文](https://proceedings.mlr.press/v267/jung25a.html?utm_source=chatgpt.com) · [PDF](https://raw.githubusercontent.com/mlresearch/v267/main/assets/jung25a/jung25a.pdf?utm_source=chatgpt.com)
+
+[5] Menda, K., Chen, Y.-C., Grana, J., Bono, J. W., Tracey, B. D., Kochenderfer, M. J., and Wolpert, D. *Deep Reinforcement Learning for Event-Driven Multi-Agent Decision Processes*. IEEE Transactions on Intelligent Transportation Systems, 2019, 20(4): 1259–1268.
+
+[DOI](https://doi.org/10.1109/TITS.2018.2848264?utm_source=chatgpt.com) · [论文 PDF](https://yi-chun-chen.github.io/DRL_event_driven.pdf?utm_source=chatgpt.com)
+
+[6] Wen, M., Kuba, J. G., Lin, R., Zhang, W., Wen, Y., Wang, J., and Yang, Y. *Multi-Agent Reinforcement Learning Is a Sequence Modeling Problem*. Advances in Neural Information Processing Systems (NeurIPS), 2022.
+
+[论文原文](https://proceedings.neurips.cc/paper_files/paper/2022/hash/69413f87e5a34897cd010ca698097d0a-Abstract-Conference.html?utm_source=chatgpt.com)
