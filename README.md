@@ -98,15 +98,15 @@ ACAC 通过 Agent-Centric History、独立时间戳和 Macro-GAE，在一定程�
 
 对于同一物理时间步内的 $m$ 个决策对象，可以将联合策略表示为：
 
-$$
-\pi_\theta(\mathbf a_t\mid s_t,\sigma_t) = \prod_{q=1}^{m} \pi_\theta \left( a_{\sigma_t(q)} \mid s_t,a_{\sigma_t(<q)},h_t^D \right)
-$$
+```math
+\pi_\theta(\mathbf a_t\mid s_t,\sigma_t) = \prod_{q=1}^{m} \pi_\theta \left( a_{\sigma_t(q)} \mid s_t,a_{\sigma_t(\lt q)},h_t^D \right)
+```
 
 其中：
 
 - $s_t$ 表示当前物理状态；
 - $\sigma_t$ 表示决策对象的处理顺序；
-- $a_{\sigma_t(<q)}$ 表示此前已经执行的动作；
+- $`a_{\sigma_t(\lt q)}`$ 表示此前已经执行的动作；
 - $h_t^D$ 表示同一物理时间步内累积的决策历史。
 
 这里需要研究两个相互关联的问题：
@@ -134,7 +134,7 @@ $$
 Q_q(s_t,a_{\leq q}) = \mathbb E_{a_{q+1:m}\sim\pi_\theta} \left[ Q(s_t,\mathbf a_t) \mid s_t,a_{\leq q} \right]
 $$
 
-其中，$Q_q$ 表示已经执行前 $q$ 个原子动作后，对剩余动作继续按照当前策略执行时的期望团队价值。
+其中，$`Q_q`$ 表示已经执行前 $`q`$ 个原子动作后，对剩余动作继续按照当前策略执行时的期望团队价值。
 
 令：
 
@@ -144,9 +144,9 @@ $$
 
 则可以构造每个原子动作的条件化优势：
 
-$$
-A_q(s_t,a_{\leq q}) = Q_q(s_t,a_{\leq q}) - Q_{q-1}(s_t,a_{<q})
-$$
+```math
+A_q(s_t,a_{\leq q}) = Q_q(s_t,a_{\leq q}) - Q_{q-1}(s_t,a_{\lt q})
+```
 
 由此得到：
 
