@@ -513,6 +513,56 @@ def rebuild(torch, np, t, history, data, role, k):
                             t(np.argwhere(mask)), torch.as_tensor(mask.sum(1).clip(1)))
 
 
+def credit_precision(torch):
+    # 单步 GRU 与 PackedSequence 会走不同 CUDA 内核，信用线统一使用完整 FP32。
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32=False
+    torch.backends.cudnn.allow_tf32=False
+    return dict(float32_matmul="highest",cuda_matmul_tf32=False,cudnn_tf32=False,
+                behavior_audit="每格首次和续跑首次；完整 rollout、更新前；logp/V 阈值 3e-4")
+
+
+def audit_rebuild(torch,np,t,chunks,dim,actor,critic,args):
+    # 按正式小批形状检查所有事件；固定切分，不扰动 PPO 的 shuffle 随机流。
+    peaks={"logp":(0.,None),"value":(0.,None)}
+    counts={"logp":0,"value":0}
+
+    def record(key, delta, mask, d, part):
+        absolute=delta.detach().abs().flatten()
+        if not torch.isfinite(absolute).all().item():
+            raise FloatingPointError(f"更新前重建含非有限 {key}")
+        val,pos=absolute.max(0)
+        counts[key]+=len(absolute)
+        error=val.item()
+        if error>peaks[key][0]:
+            i,j=np.argwhere(mask)[pos.item()]
+            peaks[key]=(error,dict(lane=part[i][0].lane,minute=int(d["clock"][i,j]),
+                                    event_slot=int(j),action=int(d["action"][i,j]) if key=="logp" else None))
+
+    mini=max(args["actor_num_mini_batch"],args["critic_num_mini_batch"])
+    for ids in np.array_split(np.arange(len(chunks)),min(len(chunks),mini)):
+        part=[chunks[i] for i in ids]
+        d=pack_events(np,part,dim)
+        hit=d["roles"]==0
+        vm=d["vmask"]
+        if hit.any():
+            h=rebuild(torch,np,t,actor.history,d,0,"ah")
+            dist=torch.distributions.Categorical(logits=actor.head(h[t(hit)]))
+            record("logp",dist.log_prob(t(d["action"][hit]))-t(d["lp"][hit]),hit,d,part)
+            del h,dist
+        if vm.any():
+            p,a=(rebuild(torch,np,t,critic.history[i],d,i,"ch") for i in range(2))
+            v=critic(p[t(vm)],a[t(vm)])[0]
+            record("value",v-t(d["value"][vm]),vm,d,part)
+            del p,a,v
+    if not all(counts.values()) or any(v[0]>3e-4 for v in peaks.values()):
+        raise AssertionError(f"完整 rollout 的更新前 GRU 校验失败：{peaks}，样本={counts}")
+    print(f"信用更新前校验通过：旧 logp 最大差={peaks['logp'][0]:.3g}（{counts['logp']} 条），"
+          f"旧 V 最大差={peaks['value'][0]:.3g}（{counts['value']} 条）",flush=True)
+    return dict(behavior_logp_max_error=peaks["logp"][0],behavior_value_max_error=peaks["value"][0],
+                behavior_logp_n=counts["logp"],behavior_value_n=counts["value"])
+
+
 def credit_update(torch, np, t, ticks, actor, critic, actor_opt, critic_opt, vn, vc, args, audit):
     chunks = chunks_for(ticks,int(args["data_chunk_length"]))
     dim = len(ticks[0][0].anchor)-128
@@ -521,7 +571,8 @@ def credit_update(torch, np, t, ticks, actor, critic, actor_opt, critic_opt, vn,
         raise RuntimeError("乘客原子样本为空或信用不是有限数")
     center, scale = all_adv.mean(), all_adv.std()+1e-5
     metrics = Metrics()
-    audit_value = audit
+    if audit:
+        metrics.add(**audit_rebuild(torch,np,t,chunks,dim,actor,critic,args))
     for ids in batches(np,len(chunks),args["ppo_epoch"],args["actor_num_mini_batch"]):
         d = pack_events(np,[chunks[i] for i in ids],dim)
         hit = d["roles"]==0
@@ -530,12 +581,6 @@ def credit_update(torch, np, t, ticks, actor, critic, actor_opt, critic_opt, vn,
         h = rebuild(torch,np,t,actor.history,d,0,"ah")
         dist = torch.distributions.Categorical(logits=actor.head(h[t(hit)]))
         logratio = dist.log_prob(t(d["action"][hit]))-t(d["lp"][hit])
-        if audit:
-            error = logratio.abs().max().item()
-            if error > 3e-4:
-                raise AssertionError(f"原子动作的旧 logp 与重建 GRU 不匹配：{error}")
-            metrics.add(behavior_logp_max_error=error)
-            audit = False
         update_policy(torch,actor,actor_opt,logratio,t((d["adv"][hit]-center)/scale),
                       dist.entropy(),args,metrics,"passenger")
     for ids in batches(np,len(chunks),args["critic_epoch"],args["critic_num_mini_batch"]):
@@ -546,12 +591,6 @@ def credit_update(torch, np, t, ticks, actor, critic, actor_opt, critic_opt, vn,
         p,a = (rebuild(torch,np,t,critic.history[i],d,i,"ch") for i in range(2))
         prediction = critic(p[t(hit)],a[t(hit)])[0]
         # 在每分钟第一条记录读 V；此时本分钟的 Aircraft 事件尚未进入历史。
-        if audit_value:
-            error = (prediction - t(d["value"][hit])).abs().max().item()
-            if error > 3e-4:
-                raise AssertionError(f"重建的分钟预动作 V 与采样值不一致：{error}")
-            metrics.add(behavior_value_max_error=error)
-            audit_value = False
         y = t(d["target"][hit])[:,None]
         loss = vc.cal_value_loss(prediction[:,None],t(d["value"][hit])[:,None],y,vn)
         old.optimize(torch,critic_opt,critic,args["value_loss_coef"]*loss,args)
@@ -1112,6 +1151,7 @@ def run(cli):
     import torch
 
     torch.set_num_threads(1)
+    precision=credit_precision(torch) if cli.line=="credit" else None
     if cli.device=="cuda" and not torch.cuda.is_available():
         raise RuntimeError("指定的 CUDA 不可用；不会自动换设备")
     versions=dict(torch=str(torch.__version__),numpy=np.__version__,
@@ -1150,7 +1190,7 @@ def run(cli):
         burst_pairs=cli.burst_pairs,burst_triples=cli.burst_triples,requests=len(burst),
         first_min=burst[0].time_min,last_min=burst[-1].time_min,
         eval_contract=base_protocol["bank"],seeds=SEEDS,rates=RATES,marks=MARKS,steps=STEPS,
-        ppo=args, device=cli.device,retain_rollouts=cli.retain_rollouts,
+        ppo=args, device=cli.device,retain_rollouts=cli.retain_rollouts,credit_precision=precision,
         common="1.0× 总量与首尾不变；同一分钟先逐人选站，最后一次走原接口，再调机一次",
         shared="B0–B2 的 Critic 只用原物理 Macro-GAE；只更换乘客优势，冻结 Aircraft 与 ObsNorm",
         credit="B2 在多乘客分钟用 Q 前缀差分，单乘客仍使用 B0；同一批的回报训练各前缀",

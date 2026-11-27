@@ -18,6 +18,11 @@ METHODS = {"B3_COMA": "order", "B4_DIFFERENCE": "credit"}
 PARENT = {"order": (16, 2*len(batch.SEEDS)*batch.STEPS),
           "credit": (12, 3*len(batch.SEEDS)*batch.STEPS)}
 WARMUP_ROLLOUTS, LABEL_WINDOW = 4, 8
+# 允许 B3 接在原 bcda961 顺序结果之后，固定仅这一版的两种换行，不接受未知旧源码。
+LEGACY_ORDER_SHA = {
+    "7954063ae75e8ebc505d52832ee9bce0d8348828d5b12c5480bfd1cde5658395",
+    "0259c77e6e4bd9c9991043ad8c681a1d975e887dfc56bfa123f840a590327757",
+}
 
 
 def check_copy(original, cloned):
@@ -362,9 +367,11 @@ def verified_parent(root, method):
     p=root/name/"PROTOCOL.json"
     contract=base.read(p)
     sha=base.digest(p)
+    current=old.same_source(Path(batch.__file__),contract["code_sha"])
+    legacy_order=name=="order" and contract["code_sha"] in LEGACY_ORDER_SHA
     if (contract["schema"]!="corridor_acac_minute_batch_v1" or contract["line"]!=name
-            or not old.same_source(Path(batch.__file__),contract["code_sha"])):
-        raise ValueError("不要覆盖正在运行的旧脚本；补充入口所用批次源码与上游不符")
+            or not (current or legacy_order)):
+        raise ValueError("补充入口与上游不符。B3 可接原版 order；B4 必须接修复后的 credit")
     done=root/name/"RUN_COMPLETE.json"
     if done.is_file():
         c=base.read(done)
@@ -379,10 +386,14 @@ def verified_parent(root, method):
         ok={(m,int(s)) for m,rows in summary["methods"].items() for s,d in rows.items()
             if d.get("job",{}).get("protocol_sha")==sha}
         failed={(r["method"],r["seed"]) for r in summary["failures"]}
-        if not failed or (ok|failed)!=expected or ok&failed:
-            raise ValueError("上游未遍历完整矩阵；请续跑上游，不自动启动后置方法")
+        if not ok or not failed or (ok|failed)!=expected or ok&failed:
+            raise ValueError("上游未完成完整矩阵或没有任何成功格；不自动启动后置方法")
         print(f"上游矩阵已遍历完整；保留 {len(failed)} 个失败格，继续独立追加实验",flush=True)
     return contract,sha
+
+
+def upstream_root(cli):
+    return cli.batch_output if METHODS[cli.method]=="order" else cli.credit_output
 
 
 def run(cli):
@@ -392,9 +403,10 @@ def run(cli):
     import torch
 
     torch.set_num_threads(1)
+    precision=batch.credit_precision(torch)
     if cli.device=="cuda" and not torch.cuda.is_available():
         raise RuntimeError("指定 CUDA 不可用，不自动换设备")
-    parent,parent_sha=verified_parent(cli.batch_output,cli.method)
+    parent,parent_sha=verified_parent(upstream_root(cli),cli.method)
     versions=dict(torch=str(torch.__version__),numpy=np.__version__,sb3=sb3.__version__,gymnasium=gym.__version__)
     cfg,original,bank,base_protocol=old.bank_for(cli,versions)
     args,_,vendor=base.harl_vendor(cli.harl_dir,np,torch)
@@ -420,7 +432,7 @@ def run(cli):
         parent_line=METHODS[cli.method],base_protocol_sha=parent["base_protocol_sha"],
         weights={s:entry["pointer"] for s,entry in sources.items()},
         train_burst=parent["train_burst"],burst_pairs=cli.burst_pairs,burst_triples=cli.burst_triples,
-        eval_contract=parent["eval_contract"],ppo=args,device=cli.device,
+        eval_contract=parent["eval_contract"],ppo=args,device=cli.device,credit_precision=precision,
         seeds=batch.SEEDS,marks=batch.MARKS,rates=batch.RATES,steps=batch.STEPS,
         observe="只用决策前可见观测、已执行历史与当前已揭示批次长度",
         branch="真实环境深拷贝；固定前缀；固定随机键；两角色后续响应；不截短终止",
@@ -433,18 +445,30 @@ def run(cli):
     env_type,_=old.observed_env(gym,np,cfg)
     batch.alignment(cli,cfg,bank,env_type,sources,np,torch)
     # 已有标准五档及突发 A0 都直接复用；只有 B0 完整时才报告配对差。
-    upstream=cli.batch_output/METHODS[cli.method]
+    upstream=upstream_root(cli)/METHODS[cli.method]
     baseline=base.read(upstream/"REUSED_BASELINES.json")
     by_seed={}
     errors=[]
 
     def report():
-        parent_report=cli.batch_output/"credit"/"SUMMARY.json"
-        current=base.read(parent_report).get("methods",{}).get("B0_SHARED",{}) if parent_report.is_file() else {}
+        credit=cli.credit_output/"credit"
+        parent_report=credit/"SUMMARY.json"
+        credit_contract=credit/"PROTOCOL.json"
+        current={}
+        credit_sha=None
+        if parent_report.is_file() and credit_contract.is_file():
+            other=base.read(credit_contract)
+            if (old.same_source(Path(batch.__file__),other["code_sha"])
+                    and all(other[k]==parent[k] for k in ("base_protocol_sha","source_protocol_sha","train_burst","marks","seeds","ppo"))
+                    and other.get("credit_precision")==precision):
+                current=base.read(parent_report).get("methods",{}).get("B0_SHARED",{})
+                credit_sha=base.digest(credit_contract)
         matched={}
         for s in map(str,batch.SEEDS):
             b0=current.get(s)
-            if b0 is not None and (b0.get("real_steps")==batch.STEPS and len(b0.get("rates",[]))==len(batch.RATES)):
+            if (b0 is not None and b0.get("real_steps")==batch.STEPS
+                    and len(b0.get("rates",[]))==len(batch.RATES)
+                    and b0.get("job",{}).get("protocol_sha")==credit_sha):
                 matched[s]=b0
         factory=argparse.Namespace(line="credit",output=cli.output)
         result={cli.method:by_seed}
@@ -495,21 +519,22 @@ def main(argv=None):
     p.add_argument("--method",choices=tuple(METHODS),required=True)
     for name in ("config","train-trace","harl-dir","base-output","acac-source","batch-output","output"):
         p.add_argument("--"+name,type=Path,required=True)
+    p.add_argument("--credit-output",type=Path,required=True,help="修复版 B0–B2 的产物根目录")
     p.add_argument("--device",choices=("cpu","cuda"),default="cuda")
     p.add_argument("--retain-rollouts",choices=("final","marks","all"),default="final")
     p.add_argument("--allow-trusted-checkpoints",action="store_true")
     cli=p.parse_args(argv)
     if not cli.allow_trusted_checkpoints:
         p.error("仅允许本账号产生的可信权重，请显式指定 --allow-trusted-checkpoints")
-    for k in ("config","train_trace","harl_dir","base_output","acac_source","batch_output","output"):
+    for k in ("config","train_trace","harl_dir","base_output","acac_source","batch_output","credit_output","output"):
         setattr(cli,k,getattr(cli,k).resolve())
     cli.output=cli.output/cli.method
-    for r in (cli.base_output,cli.acac_source,cli.batch_output):
+    for r in (cli.base_output,cli.acac_source,cli.batch_output,cli.credit_output):
         if cli.output==r or r in cli.output.parents or cli.output in r.parents:
             p.error("补充实验必须使用独立输出目录")
     with base.lock_run(cli.output):
         try:
-            verified_parent(cli.batch_output,cli.method)
+            verified_parent(upstream_root(cli),cli.method)
             return run(cli)
         except (KeyboardInterrupt,InterruptedError) as exc:
             print(f"暂停：{exc}",flush=True)
